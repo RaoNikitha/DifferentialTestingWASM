@@ -1,0 +1,46 @@
+[
+    {
+        "bug_class": "Incorrect Branch Target Resolution",
+        "description": "WASM's branching instructions rely on specifying labels to determine the branch target. A bug in resolving these labels can cause the control flow to jump to the wrong location, leading to unexpected behavior. For example, the 'br' instruction incorrectly jumps to a different block or loop than intended, causing the program to skip essential code or enter an infinite loop."
+    },
+    {
+        "bug_class": "Stack Corruption",
+        "description": "WASM uses a stack-based execution model, and control flow instructions often manipulate this stack. Bugs can occur if the stack is improperly managed, leading to stack underflows, overflows, or corruption. For instance, a 'call' instruction that incorrectly manages function arguments and return values could corrupt the stack, causing subsequent instructions to operate on incorrect data."
+    },
+    {
+        "bug_class": "Unreachable Code Execution",
+        "description": "WASM has an 'unreachable' instruction meant to signal that certain code paths should never be executed. A bug might cause the control flow to erroneously reach this instruction, leading to a trap or crash. For example, an incorrect branch causes the program to reach an 'unreachable' instruction, leading to an unexpected termination of the program."
+    },
+    {
+        "bug_class": "Infinite Loops",
+        "description": "Improper implementation of loop-related control flow instructions ('loop', 'br_if', 'br') can lead to infinite loops, where the program gets stuck and never exits the loop. For example, a 'br_if' instruction meant to exit a loop fails to do so due to incorrect condition evaluation, resulting in the loop running indefinitely."
+    },
+    {
+        "bug_class": "Mismanagement of Block Nesting",
+        "description": "WASM allows for nested blocks, loops, and conditional branches. Bugs can occur if the implementation fails to correctly manage these nested structures, leading to incorrect flow of control. For instance, a 'br_table' instruction that incorrectly interprets the depth of nested blocks can cause the control flow to exit the wrong block or loop."
+    },
+    {
+        "bug_class": "Incorrect Condition Evaluation",
+        "description": "Conditional branches like 'br_if' rely on evaluating a condition. A bug in the condition evaluation can lead to incorrect branching decisions. For example, a 'br_if' instruction always taking the branch, regardless of the condition's value, leading to unintended code execution paths."
+    },
+    {
+        "bug_class": "Invalid or Inconsistent Control Flow Graph",
+        "description": "The control flow graph represents the possible paths that execution can take through the code. Bugs can occur if the CFG is incorrectly generated or interpreted, leading to issues like unreachable code, incorrect loop structures, or misaligned branches. For example, the CFG fails to account for certain edge cases, causing some branches or loops to never be taken, even when they should be."
+    },
+    {
+        "bug_class": "Improper Function Call or Return Handling",
+        "description": "WASM control flow includes function calls ('call', 'call_indirect') and returns. Bugs can arise if these are not properly implemented, leading to incorrect function call sequences or return values. For example, a 'call_indirect' instruction that jumps to the wrong function due to incorrect type checking or indirect table lookup, leading to execution of unintended code."
+    },
+    {
+        "bug_class": "Type Mismatch in Control Flow Instructions",
+        "description": "WASM is strongly typed, and control flow instructions must adhere to specific type constraints. Bugs can occur if these constraints are not correctly enforced or checked. For instance, a 'block' or 'loop' instruction that assumes incorrect types for its result values, leading to runtime type errors when the block is exited."
+    },
+    {
+        "bug_class": "Edge Case Failures in br_table",
+        "description": "The 'br_table' instruction performs an indirect branch based on an index. Bugs can occur if the index is out of bounds or if the implementation fails to handle edge cases properly. For example, a 'br_table' instruction that does not properly handle cases where the index exceeds the number of available targets, leading to undefined behavior."
+    },
+    {
+        "bug_class": "Incorrect Handling of Control Flow Across Module Boundaries",
+        "description": "WASM modules can import and export functions, and bugs can occur if control flow instructions don't correctly handle calls or returns across module boundaries. For example, a 'call' to an imported function that doesn't correctly handle the transition between the calling and called module, leading to stack corruption or incorrect execution flow."
+    }
+]

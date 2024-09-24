@@ -1,0 +1,1828 @@
+// Copyright 2020 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+// Reusable validator that checks well-formedness of Wasm functions' code.
+def OUT = Trace.OUT;
+class CodeValidator(extensions: Extension.set, limits: Limits, module: Module, err: ErrorGen) {
+	def codeptr = CodePtr.new(null);
+	def parser = WasmParser.new(extensions, limits, module, err, codeptr);
+	def instrTracer = if(Trace.validation, InstrTracer.new());
+	def locals = Vector<ValueType>.new();
+	def val_stack = ArrayStack<ValueType>.new();
+	def init_status = Vector<InitStatus>.new();
+	def ctl_stack = ArrayStack<ControlEntry>.new();
+	def ctlxfer = SidetableBuilder.new();
+	def ex_handlers = Vector<ExHandlerEntry>.new();
+	def resume_handlers = Vector<ExHandlerEntry>.new();
+	var ctl_top: ControlEntry;  // FAST: cache of top of control stack
+	var func_start_pos: int;
+	var func: FuncDecl;
+	var sig: SigDecl;
+	var opcode_pos: int;
+	var validatingInitExpr = false;
+	var init_stack: ArrayStack<InitExpr>;
+	var probe: (CodeValidator, int, Opcode) -> void;
+
+	new() {
+		codeptr.onError = err.onDataReaderError;
+	}
+
+	def validateFunc(f: FuncDecl) -> CodeValidatorResult {
+		codeptr.reset(f.orig_bytecode, 0, f.orig_bytecode.length);
+		return validate(f, codeptr);
+	}
+	def validate(func: FuncDecl, d: DataReader) -> CodeValidatorResult {
+		return Metrics.validate_time_us.run(validateFunc0, (func, d));
+	}
+	def validateInitExpr(expected: SigDecl, d: DataReader) -> CodeValidatorResult {
+		return Metrics.validate_time_us.run(validateExpr0, (expected, d));
+	}
+	private def validateFunc0(func: FuncDecl, d: DataReader) -> CodeValidatorResult {
+		// Reset internal state.
+		if (Trace.validation) OUT.put2("==== begin validate: func %q: %q ========================", func.render(module.names, _), func.sig.render).ln();
+		this.func = func;
+		resetSig(func.sig);
+		resetCode(d);
+
+		// Read and initialize locals.
+		if (!readLocals(locals)) return reterr();
+		func.num_locals = u16.!(locals.length);
+
+		// Push initial control.
+		opcode_pos = codeptr.pos;
+		pushControl(Opcode.UNREACHABLE.code, sig.params, sig.results, 0);
+
+		// Run validation.
+		validatingInitExpr = false;
+		validateCode();
+
+		// Check function body is properly terminated.
+		if (ctl_stack.top != 0 && err.ok()) {
+			// TODO: double-check this error position
+			err.rel(codeptr, func.orig_bytecode.length).UnterminatedFunctionBody();
+		}
+
+		// Extract sidetable.
+		func.sidetable = ctlxfer.extract();
+
+		if (func.sidetable.entries == null) System.error(null, null); // TODO: keep alive
+		if (ex_handlers.length > 0) func.handlers = ex_handlers.extract();
+		if (resume_handlers.length > 0) func.resume_handlers = resume_handlers.extract();
+
+		// Report metrics and return success.
+		if (err.ok()) {
+			// Metric collection.
+			Metrics.validate_bytes.val += u32.view(func.orig_bytecode.length);
+			// Return success.
+			return CodeValidatorResult.Ok;
+		}
+		return reterr();
+	}
+	private def validateExpr0(sig: SigDecl, d: DataReader) -> CodeValidatorResult {
+		if (Trace.validation) OUT.put1("validate(expr: %q)", sig.render).ln();
+		resetSig(sig);
+		resetCode(d);
+		opcode_pos = codeptr.pos;
+		pushControl(Opcode.UNREACHABLE.code, sig.params, sig.results, 0);
+		if (init_stack == null) init_stack = ArrayStack.new();
+		else init_stack.top = 0;
+
+		// Run validation.
+		validatingInitExpr = true;
+		validateCode();
+		d.reset(codeptr.data, codeptr.pos, d.limit);
+		if (ctl_stack.top != 0 && err.ok()) {
+			err.rel(codeptr, codeptr.pos).UnterminatedInitExpr();
+		}
+		if (err.ok()) {
+			// Metric collection.
+			Metrics.validate_bytes.val += u32.view(d.pos - func_start_pos);
+			// Return success.
+			return CodeValidatorResult.Ok;
+		}
+		return reterr();
+	}
+	private def resetSig(sig: SigDecl) {
+		this.sig = sig;
+		val_stack.clear();
+		locals.resize(0);
+		init_status.resize(0);
+		locals.puta(sig.params);
+		init_status.putn(InitStatus.INIT, sig.params.length);
+	}
+	private def resetCode(d: DataReader) {
+		codeptr.reset(d.data, d.pos, d.limit);
+		parser.reset(codeptr);
+		func_start_pos = d.pos;
+		ctl_stack.clear();
+		ctlxfer.reset(codeptr.pos);
+		ex_handlers.resize(0);
+		resume_handlers.resize(0);
+	}
+	def readLocals(vec: Vector<ValueType>) -> bool {
+		var start = vec.length, max = limits.max_num_locals;
+		var dcount = parser.readU32("local decl count", max);
+		for (i < dcount) {
+			var pt = codeptr.pos;
+			var count = parser.readU32("local count", max);
+			var pt2 = codeptr.pos;
+			var ltype = parser.readValueType();
+			var init = if(ValueTypes.hasDefaultValue(ltype), InitStatus.INIT, InitStatus.UNINIT);
+			if (count <= limits.max_num_locals) init_status.putn(init, int.view(count));
+			if (!err.ok()) return false;
+			if (Trace.validation) traceLocals(count, ltype);
+			vec.putn(ltype, int.!(count));
+			var size = vec.length - start;
+			if (size > max) {
+				err.rel(codeptr, pt).QuantityExceededMaximumI("maximum total locals", size, max);
+				return false;
+			}
+		}
+		return true;
+	}
+	def reterr() -> CodeValidatorResult.Error {
+		return CodeValidatorResult.Error(err.error_code, int.!(err.error_pos), err.error_msg);
+	}
+	def traceLocals(count: u32, ltype: ValueType) {
+		OUT.put2("  locals %d: %q", count, ltype.render).ln();
+	}
+	def err_atpc() -> ErrorGen {
+		return err.rel(codeptr, opcode_pos);
+	}
+	def err_atpos(pos: int) -> ErrorGen {
+		return err.rel(codeptr, pos);
+	}
+	def validateCode() {
+		while (codeptr.pos < codeptr.limit) {
+			var constExpr = false;
+			opcode_pos = codeptr.pos;
+			var opcode = codeptr.read_opcode();
+			if (probe != null) probe(this, opcode_pos, opcode);
+			if (Trace.validation) { traceOpcode(); traceStack(true); }
+			// FAST: Handle short operators (predictable direct branch)
+			if (Opcodes.attributes[opcode.prefix].SHORT_OP) {
+				checkSignature(opcode.sig);
+				if (Trace.validation) traceStack(false);
+				continue;
+			}
+			// Handle all other operators in the switch (indirect branch)
+			match (opcode) {
+				CRASH_EXEC, CRASH_COMPILER => {
+					if (!checkExtension(Extension.WIZENG, opcode)) return;
+					// nop otherwise
+				}
+				UNREACHABLE => {
+					setUnreachable();
+				}
+				BLOCK => {
+					var pr = parser.readBlockType();
+					checkArgsAndPushControl(opcode, pr.0, pr.1);
+				}
+				LOOP => {
+					var pr = parser.readBlockType();
+					checkArgsAndPushControl(opcode, pr.0, pr.1);
+					ctl_top.sidetable_pos = ctlxfer.sidetable.length;
+				}
+				IF => {
+					var pr = parser.readBlockType();
+					popE(ValueType.I32);
+					var ctl = checkArgsAndPushControl(opcode, pr.0, pr.1);
+					ctlxfer.refElse(ctl, opcode_pos);
+					ctl_top.reachable = true; // true block now reachable
+				}
+				ELSE => {
+					if (ctl_top.start_opcode != Opcode.IF.code) return err_atpc().MismatchedElse();
+					checkArgsAndTransfer();
+					resetInit();
+					// "else" implicitly goes to end
+					ctlxfer.ref0(ctl_top, opcode_pos);
+					// branch from "if" will go to instruction after else
+					ctlxfer.bindElse(ctl_top, opcode_pos + 1);
+
+					ctl_top.start_opcode = opcode.code;
+					ctl_top.reachable = true;
+					val_stack.top = ctl_top.val_stack_top;
+					pushTypes(ctl_top.params);
+				}
+				TRY => {
+					if (!checkExtension(Extension.EXCEPTION_HANDLING, opcode)) return;
+					var pr = parser.readBlockType();
+					checkArgsAndPushControl(opcode, pr.0, pr.1);
+					ctl_top.sidetable_pos = ctlxfer.sidetable.length;
+					ctl_top.try_end = -1;
+					ctl_top.delegate_pos = opcode_pos + 1;
+				}
+				CATCH => {
+					if (!checkExtension(Extension.EXCEPTION_HANDLING, opcode)) return;
+					if (ctl_top.start_opcode != Opcode.TRY.code && ctl_top.start_opcode != Opcode.CATCH.code) {
+						return err_atpc().MismatchedCatch();
+					}
+					var range = startExHandler();
+					ctl_top.start_opcode = opcode.code;
+					ctl_top.delegate_pos = opcode_pos;
+					var tag = parser.readTagRef();
+					if (tag == null) return;
+					ctlxfer.ref0(ctl_top, opcode_pos);  // implicit jump to end of try block
+					var ex_slot = findExSlot(null).0;
+					var info = ExHandlerInfo.Direct(codeptr.pos - func_start_pos, ex_slot, ctl_top.val_stack_top, ctlxfer.sidetable.length);
+					ex_handlers.put(ExHandlerEntry(tag.tag_index, range.0, range.1, info));
+					checkArgsAndTransfer();
+					resetInit();
+					val_stack.top = ctl_top.val_stack_top;
+					val_stack.pusha(tag.fields);
+				}
+				THROW => {
+					if (!checkExtension(Extension.EXCEPTION_HANDLING, opcode)) return;
+					var tag = parser.readTagRef();
+					if (tag == null) return;
+					checkAndPopArgs(tag.fields);
+					setUnreachable();
+				}
+				RETHROW => {
+					if (!checkExtension(Extension.EXCEPTION_HANDLING, opcode)) return;
+					var depth = parser.readLabel();
+					var target = getControl(depth);
+					var t = findExSlot(target), ex_slot = t.0, found = t.1;
+					if (!found || (target.start_opcode != Opcode.CATCH.code &&
+						target.start_opcode != Opcode.CATCH_ALL.code)) {
+						err_atpc().RethrowNotInCatch();
+					}
+					var popcount = val_stack.top - ctl_top.val_stack_top;
+					ctlxfer.rethrow(ex_slot, popcount);
+					setUnreachable();
+				}
+				THROW_REF => {
+					if (!checkExtension(Extension.EXCEPTION_HANDLING, opcode)) return;
+					popE(ValueTypes.EXNREF);
+					setUnreachable();
+				}
+				END => {
+					constExpr = true;
+					if (ctl_stack.top == 0) return err_atpc().EmptyControlStack();
+					checkArgsAndTransfer();
+					var ctl = ctl_stack.peek();
+					match (ctl.start_opcode) {
+						Opcode.LOOP.code => {
+							ctlxfer.bind(ctl, ctl.start_pos, ctl.sidetable_pos);
+						}
+						Opcode.IF.code => {
+							// one-armed if; simulate an empty else clause
+							val_stack.top = ctl.val_stack_top;
+							ctl.reachable = true;
+							pushTypes(ctl.params); // TODO: write spec test for {if[t] end}
+							checkArgsAndTransfer();
+							ctlxfer.bindElse(ctl, opcode_pos);
+							ctlxfer.bind(ctl, opcode_pos, ctlxfer.sidetable.length);
+						}
+						Opcode.TRY_TABLE.code => {
+							// finish exception handler entries
+							var sidetable_pos = ctl.sidetable_pos;
+							ctlxfer.bind(ctl, opcode_pos, ctlxfer.sidetable.length);
+							for (i < ctl.catches.length) {
+								var c = ctl.catches[i];
+								var sidetable_entry = sidetable_pos + (i * Sidetable_CatchEntry.size / 4); // TODO: entry size
+								var info = ExHandlerInfo.Sidetable(c.exnref, sidetable_entry);
+								var tag_index = if(c.tag != null, c.tag.tag_index, Modules.EX_TAG_ALL);
+								ex_handlers.put(ExHandlerEntry(tag_index, ctl.start_pos - func_start_pos, opcode_pos - func_start_pos, info));
+							}
+						}
+						_ => {
+							ctlxfer.bind(ctl, opcode_pos, ctlxfer.sidetable.length);
+						}
+					}
+					resetInit();
+					ctl_stack.pop();
+					if (validatingInitExpr && ctl_stack.empty()) { // END finished the init expr
+						codeptr.reset(codeptr.data, codeptr.pos, codeptr.pos);
+					} else {
+						ctl_top = ctl_stack.peek();
+					}
+				}
+				BR => {
+					var depth = parser.readLabel();
+					var target = getControl(depth);
+					if (target == null) return;
+					ctlxfer.refS(target, opcode_pos, val_stack.top);
+					checkAndPopArgs(labelArgs(target));
+					setUnreachable();
+				}
+				BR_IF => {
+					var depth = parser.readLabel();
+					var target = getControl(depth);
+					if (target == null) return;
+					popE(ValueType.I32);
+					ctlxfer.refS(target, opcode_pos, val_stack.top);
+					var args = labelArgs(target);
+					checkAndPopArgs(args);
+					pushTypes(args);
+				}
+				BR_TABLE => {
+					var labels = parser.readLabels();
+					popE(ValueType.I32);
+					ctlxfer.sidetable.put(labels.length).put(0).put(0).put(0);
+					// add refs for all labels and check args
+					var arity = -1;
+					for (i < labels.length) {
+						if (err.error()) return;
+						var target = getControl(labels[i]);
+						if (target == null) return;
+						var args = labelArgs(target);
+						if (arity < 0) arity = args.length;
+						else if (arity != args.length) err_atpc().BrTableArityMismatch(arity, i, args.length);
+						checkTargetArgs(target);
+						ctlxfer.refS(target, opcode_pos + i + 1, val_stack.top);
+					}
+					setUnreachable();
+				}
+				RETURN => {
+					checkAndPopArgs(sig.results);
+					setUnreachable();
+				}
+				CALL => {
+					var func = parser.readFuncRef();
+					if (func == null) return;
+					checkSignature(func.sig);
+				}
+				CALL_INDIRECT => {
+					var sig = parser.readSigRef();
+					var t = parser.readTableImm();
+					popE(ValueType.I32);
+					if (sig == null) return;
+					checkSignature(sig);
+				}
+				RETURN_CALL => {
+					if (!checkExtension(Extension.TAIL_CALL, opcode)) return;
+					var func = parser.readFuncRef();
+					if (func == null) return;
+					checkAndPopArgs(func.sig.params);
+					checkReturnSig(func.sig.results);
+					setUnreachable();
+				}
+				RETURN_CALL_INDIRECT => {
+					if (!checkExtension(Extension.TAIL_CALL, opcode)) return;
+					var sig = parser.readSigRef();
+					var t = parser.readTableImm();
+					popE(ValueType.I32);
+					if (sig == null) return;
+					checkAndPopArgs(sig.params);
+					checkReturnSig(sig.results);
+					setUnreachable();
+				}
+				CALL_REF => {
+					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
+					var sig = parser.readSigRef();
+					if (sig == null) return;
+					popE(ValueTypes.Ref(true, sig)); // XXX: avoid allocation
+					checkSignature(sig);
+				}
+				RETURN_CALL_REF => {
+					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
+					var sig = parser.readSigRef();
+					if (sig == null) return;
+					popE(ValueTypes.Ref(true, sig)); // XXX: avoid allocation
+					checkAndPopArgs(sig.params);
+					checkReturnSig(sig.results);
+					setUnreachable();
+				}
+				DELEGATE => {
+					if (!checkExtension(Extension.EXCEPTION_HANDLING, opcode)) return;
+					if (ctl_top.start_opcode != Opcode.TRY.code) return err_atpc().MismatchedDelegate();
+					var range = startExHandler();
+					var depth = parser.readLabel();
+					var target = getControl(depth + 1);
+					if (target == null) return;
+					checkArgsAndTransfer();
+					var info = ExHandlerInfo.Direct(target.delegate_pos - func_start_pos, 0, ctl_top.val_stack_top, ctlxfer.sidetable.length);
+					ex_handlers.put(ExHandlerEntry(Modules.EX_TAG_DELEGATE, range.0, range.1, info));
+					ctlxfer.bind(ctl_top, opcode_pos, ctlxfer.sidetable.length);
+					resetInit();
+					ctl_stack.pop();
+					ctl_top = ctl_stack.peek();
+				}
+				CATCH_ALL => {
+					if (!checkExtension(Extension.EXCEPTION_HANDLING, opcode)) return;
+					if (ctl_top.start_opcode != Opcode.TRY.code && ctl_top.start_opcode != Opcode.CATCH.code) {
+						return err_atpc().MismatchedCatch();
+					}
+					ctl_top.start_opcode = opcode.code;
+					ctl_top.delegate_pos = opcode_pos;
+					var range = startExHandler();
+					checkArgsAndTransfer();
+					ctlxfer.ref0(ctl_top, opcode_pos); // implicit jump to end of try block
+					var ex_slot = findExSlot(null).0;
+					var info = ExHandlerInfo.Direct(codeptr.pos - func_start_pos, ex_slot, ctl_top.val_stack_top, ctlxfer.sidetable.length);
+					ex_handlers.put(ExHandlerEntry(Modules.EX_TAG_ALL, range.0, range.1, info));
+					resetInit();
+					val_stack.top = ctl_top.val_stack_top;
+				}
+				DROP => {
+					popAny();
+				}
+				SELECT => {
+					popE(ValueType.I32);
+					var t = popAny();
+					var rt = t.0;
+					if (!ValueTypes.isNumeric(rt)) err_atpc().IllegalSelectType(rt);
+					popE(rt);
+					push(rt);
+				}
+				SELECT_T => {
+					var at = parser.readValueTypes("select count", limits.max_num_select_results);
+					if (at.length == 0) err_atpc().IllegalSelectCount();
+					popE(ValueType.I32);
+					checkAndPopArgs(at);
+					checkAndPopArgs(at);
+					pushTypes(at);
+				}
+				TRY_TABLE => {
+					var pr = parser.readBlockType();
+					var catches = parser.readCatches();
+					if (catches == null) return;
+					var sidetable_pos = ctlxfer.sidetable.length;
+					for (i < catches.length) {
+						var c = catches[i];
+						var target = getControl(c.depth);
+						if (target == null) return;
+						checkTargetCatch(i, c, target);
+						ctlxfer.refC(target, c.tag, c.exnref);
+					}
+					checkArgsAndPushControl(opcode, pr.0, pr.1);
+					ctl_top.catches = catches;
+					ctl_top.sidetable_pos = sidetable_pos;
+					ctl_top.try_end = -1;
+					ctl_top.delegate_pos = opcode_pos + 1;
+				}
+				LOCAL_GET => {
+					var index = parser.readLocalIndex();
+					var t = getLocalType(index);
+					checkInit(index);
+					push(t);
+				}
+				LOCAL_SET => {
+					var index = parser.readLocalIndex();
+					var t = getLocalType(index);
+					setInit(index);
+					popE(t);
+				}
+				LOCAL_TEE => {
+					var index = parser.readLocalIndex();
+					var t = getLocalType(index);
+					setInit(index);
+					popE(t);
+					push(t);
+				}
+				GLOBAL_GET => {
+					var g = parser.readGlobalRef();
+					if (g == null) return;
+					if (validatingInitExpr) {
+						if (g.mutable) err_atpc().ExpectedImmutableGlobalInInit(g);
+						else if (g.imp == null && !extensions.GC) err_atpc().ExpectedImportedGlobalInInit(g);
+						else constExpr = true;
+						init_stack.push(InitExpr.Global(g.global_index, g));
+					}
+					push(g.valtype);
+				}
+				GLOBAL_SET => {
+					var g = parser.readGlobalRef();
+					if (g == null) return;
+					if (!g.mutable) {
+						err_atpc().IllegalAssignmentToImmutableGlobal(g.global_index);
+ 					}
+					popE(g.valtype);
+				}
+				TABLE_GET => {
+					var table = parser.readTableRef();
+					if (table == null) return;
+					popE(ValueType.I32);
+					push(table.elemtype);
+				}
+				TABLE_SET => {
+					var table = parser.readTableRef();
+					if (table == null) return;
+					popE(table.elemtype);
+					popE(ValueType.I32);
+				}
+
+				I32_LOAD8_S,
+				I32_LOAD8_U	=> checkLoad(opcode, 0, ValueType.I32);
+				I64_LOAD8_S,
+				I64_LOAD8_U	=> checkLoad(opcode, 0, ValueType.I64);
+				I32_STORE8	=> checkStore(opcode, 0, ValueType.I32);
+				I64_STORE8	=> checkStore(opcode, 0, ValueType.I64);
+
+				I32_LOAD16_S,
+				I32_LOAD16_U	=> checkLoad(opcode, 1, ValueType.I32);
+				I64_LOAD16_S,
+				I64_LOAD16_U	=> checkLoad(opcode, 1, ValueType.I64);
+				I32_STORE16	=> checkStore(opcode, 1, ValueType.I32);
+				I64_STORE16	=> checkStore(opcode, 1, ValueType.I64);
+
+				I32_LOAD	=> checkLoad(opcode, 2, ValueType.I32);
+				F32_LOAD 	=> checkLoad(opcode, 2, ValueType.F32);
+				I64_LOAD32_S,
+				I64_LOAD32_U	=> checkLoad(opcode, 2, ValueType.I64);
+				I32_STORE	=> checkStore(opcode, 2, ValueType.I32);
+				F32_STORE	=> checkStore(opcode, 2, ValueType.F32);
+				I64_STORE32	=> checkStore(opcode, 2, ValueType.I64);
+
+				I64_LOAD	=> checkLoad(opcode, 3, ValueType.I64);
+				F64_LOAD	=> checkLoad(opcode, 3, ValueType.F64);
+				I64_STORE	=> checkStore(opcode, 3, ValueType.I64);
+				F64_STORE	=> checkStore(opcode, 3, ValueType.F64);
+
+				MEMORY_SIZE,
+				MEMORY_GROW => {
+					var index = parser.readMemoryImm();
+					checkSignature(opcode.sig);
+				}
+				I32_CONST => {
+					constExpr = true;
+					var val = codeptr.read_sleb32();
+					push(ValueType.I32);
+					if (validatingInitExpr) init_stack.push(InitExpr.I32(val));
+				}
+				I64_CONST => {
+					constExpr = true;
+					var val = codeptr.read_sleb64();
+					push(ValueType.I64);
+					if (validatingInitExpr) init_stack.push(InitExpr.I64(val));
+				}
+				F32_CONST => {
+					constExpr = true;
+					var val = codeptr.read_u32();
+					push(ValueType.F32);
+					if (validatingInitExpr) init_stack.push(InitExpr.F32(val));
+				}
+				F64_CONST => {
+					constExpr = true;
+					var val = codeptr.read_u64();
+					push(ValueType.F64);
+					if (validatingInitExpr) init_stack.push(InitExpr.F64(val));
+				}
+				REF_NULL => {
+					constExpr = true;
+					var ht = parser.readHeapType();
+					push(ValueType.Ref(true, ht));
+					if (validatingInitExpr) init_stack.push(InitExpr.ExternRefNull); // TODO: add heap type
+				}
+				REF_IS_NULL => {
+					popRef();
+					push(ValueType.I32);
+				}
+				REF_FUNC => {
+					constExpr = true;
+					var func = parser.readFuncRef();
+					if (func == null) return;
+					if (validatingInitExpr) func.reffed = true;
+					else if (!func.reffed) err_atpc().IllegalFuncRef(func);
+					var ftype = if(extensions.FUNCTION_REFERENCES,
+						ValueTypes.RefFunc(false, func.sig),
+						ValueTypes.FUNCREF);
+					push(ftype);
+					if (validatingInitExpr) init_stack.push(InitExpr.FuncRef(func.func_index, func));
+				}
+				REF_AS_NON_NULL => {
+					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
+					var t = popAny();
+					if (t.1) push(asNonNullRefType(t.0));
+				}
+				BR_ON_NULL,
+				BR_ON_NON_NULL => {
+					if (!checkExtension(Extension.FUNCTION_REFERENCES, opcode)) return;
+					var depth = parser.readLabel();
+					var target = getControl(depth);
+					if (target == null) return;
+					var t = popAny();
+					if (t.1) {
+						var rt = t.0, nonnull = asNonNullRefType(rt);
+						if (opcode.code == Opcode.BR_ON_NON_NULL.code) {
+							push(nonnull);
+							ctlxfer.refS(target, opcode_pos, val_stack.top);
+							var args = labelArgs(target);
+							checkAndPopArgs(args);
+							pushTypes(args);
+							popAny();
+						} else {
+							ctlxfer.refS(target, opcode_pos, val_stack.top);
+							var args = labelArgs(target);
+							checkAndPopArgs(args);
+							pushTypes(args);
+							push(nonnull);
+						}
+					}
+				}
+				REF_EQ => {
+					if (noGC(opcode)) return;
+					popE(ValueTypes.EQREF);
+					popE(ValueTypes.EQREF);
+					push(ValueType.I32);
+				}
+				STRUCT_NEW => {
+					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if fields are immutable?
+					var st = parser.readStructType();
+					if (st == null) return;
+					checkAndPopFields(st.field_types);
+					push(ValueTypes.RefStruct(false, st));
+					if (validatingInitExpr) {
+						var vals = Array<InitExpr>.new(st.field_types.length);
+						for (i = vals.length - 1; i >= 0; i--) vals[i] = init_stack.pop();
+						var ht = HeapType.Struct(st);
+						init_stack.push(InitExpr.Struct(ht, vals));
+					}
+				}
+				STRUCT_NEW_DEFAULT => {
+					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if fields are immutable?
+					var st = parser.readStructType();
+					if (st == null) return;
+					var stt = ValueTypes.RefStruct(false, st);
+					if (!st.defaultable) err_atpc().ExpectedDefaultableHeapType(stt);
+					push(stt);
+					if (validatingInitExpr) {
+						var vals = Array<InitExpr>.new(st.field_types.length);
+						for (i < vals.length) vals[i] = InitExpr.Const(Values.default(st.field_types[i].valtype));
+						var ht = HeapType.Struct(st);
+						init_stack.push(InitExpr.Struct(ht, vals));
+					}
+				}
+				STRUCT_GET => {
+					if (noGC(opcode)) return;
+					var st = parser.readStructType();
+					var index = parser.readFieldIndex(st);
+					if (index < 0) return;
+					popE(ValueTypes.RefStruct(true, st));
+					var ft = st.field_types[index];
+					if (ft.pack != Packedness.UNPACKED) err_atpc().ExpectedUnpackedType(ft);
+					push(ft.valtype);
+				}
+				STRUCT_GET_S, // fallthrough
+				STRUCT_GET_U => {
+					if (noGC(opcode)) return;
+					var st = parser.readStructType();
+					var index = parser.readFieldIndex(st);
+					if (index < 0) return;
+					popE(ValueTypes.RefStruct(true, st));
+					var ft = st.field_types[index];
+					if (ft.pack == Packedness.UNPACKED) err_atpc().ExpectedPackedType(ft);
+					push(ft.valtype);
+				}
+				STRUCT_SET => {
+					if (noGC(opcode)) return;
+					var st = parser.readStructType();
+					var index = parser.readFieldIndex(st);
+					if (index < 0) return;
+					var ft = st.field_types[index];
+					var stt = ValueTypes.RefStruct(true, st);
+					if (!ft.mutable) {
+						err_atpc().IllegalAssignmentToImmutableField(stt, u32.view(index));
+					}
+					popE(ft.valtype);
+					popE(stt);
+				}
+				ARRAY_NEW => {
+					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if fields are immutable?
+					var at = parser.readArrayType();
+					if (at == null) return;
+					popE(ValueType.I32);
+					checkAndPopFields(at.elem_types);
+					push(ValueTypes.RefArray(false, at));
+					if (validatingInitExpr) {
+						var len = init_stack.pop();
+						var elem = init_stack.pop();
+						var ht = HeapType.Array(at);
+						init_stack.push(InitExpr.Array(ht, len, elem));
+					}
+				}
+				ARRAY_NEW_DEFAULT => {
+					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if fields are immutable?
+					var at = parser.readArrayType();
+					if (at == null) return;
+					var att = ValueTypes.RefArray(false, at);
+					if (!at.defaultable) err_atpc().ExpectedDefaultableHeapType(att);
+					popE(ValueType.I32);
+					push(att);
+					if (validatingInitExpr) {
+						var len = init_stack.pop();
+						var elem = InitExpr.Const(Values.default(at.elem_types[0].valtype));
+						var ht = HeapType.Array(at);
+						init_stack.push(InitExpr.Array(ht, len, elem));
+					}
+				}
+				ARRAY_GET => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					popE(ValueType.I32);
+					popE(ValueTypes.RefArray(true, at));
+					for (et in at.elem_types) {
+						if (et.pack != Packedness.UNPACKED) err_atpc().ExpectedUnpackedType(et);
+						push(et.valtype);
+					}
+				}
+				ARRAY_GET_S, // fallthrough
+				ARRAY_GET_U => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					popE(ValueType.I32);
+					popE(ValueTypes.RefArray(true, at));
+					for (et in at.elem_types) {
+						if (et.pack == Packedness.UNPACKED) err_atpc().ExpectedPackedType(et);
+						push(et.valtype);
+					}
+				}
+				ARRAY_SET => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (!checkArrayIsMutable(at, true)) return;
+					popE(ValueType.I32);
+					popE(ValueTypes.RefArray(true, at));
+				}
+				ARRAY_LEN => {
+					if (noGC(opcode)) return;
+					popE(ValueTypes.ARRAYREF);
+					push(ValueType.I32);
+				}
+				ARRAY_FILL => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (!checkArrayIsMutable(at, true)) return;
+					popE(ValueType.I32);
+					popE(ValueType.I32);
+					popE(ValueType.Ref(true, HeapType.Array(at)));
+				}
+				ARRAY_COPY => {
+					if (noGC(opcode)) return;
+					var at1 = parser.readArrayType(), at2 = parser.readArrayType();
+					if (!checkArrayIsMutable(at1, false) || at2 == null) return;
+					for (i < at1.elem_types.length) {
+						var dst = at1.elem_types[i], src = at2.elem_types[i];
+						if (dst.pack != src.pack || !ValueTypes.isAssignable(dst.valtype, src.valtype)) err_atpc().ElementTypeMismatch2(dst, src);
+					}
+					popE(ValueType.I32); // size
+					popE(ValueType.I32); // src_offset
+					popE(ValueType.Ref(true, HeapType.Array(at2))); // src
+					popE(ValueType.I32); // dst_offset
+					popE(ValueType.Ref(true, HeapType.Array(at1))); // dst
+				}
+				ARRAY_INIT_DATA => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					var index = parser.readDataIndex();
+					if (!checkArrayIsMutable(at, false)) return;
+					if (!checkArrayIsPrimitive(at, false)) return;
+					popE(ValueType.I32);
+					popE(ValueType.I32);
+					popE(ValueType.I32);
+					popE(ValueType.Ref(true, HeapType.Array(at)));
+				}
+				ARRAY_INIT_ELEM => {
+					if (noGC(opcode)) return;
+					var at = parser.readArrayType();
+					if (at == null) return;
+					var elem = parser.readElemRef();
+					if (elem == null) return;
+					if (!checkArrayIsMutable(at, false)) return;
+					if (!ValueTypes.isAssignable(elem.elemtype, at.elem_types[0].valtype)) {
+						err_atpc().ElementTypeMismatch(at.elem_types[0].valtype, elem.elemtype);
+					}
+					popE(ValueType.I32);
+					popE(ValueType.I32);
+					popE(ValueType.I32);
+					popE(ValueTypes.RefArray(true, at));
+				}
+				ARRAY_NEW_FIXED => {
+					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if elem is immutable?
+					var at = parser.readArrayType();
+					if (at == null) return;
+					var size = codeptr.read_uleb31();
+					for (i < size) checkAndPopFields(at.elem_types);
+					push(ValueTypes.RefArray(false, at));
+					if (validatingInitExpr) {
+						var vals = Array<InitExpr>.new(size);
+						for (i = vals.length - 1; i >= 0; i--) vals[i] = init_stack.pop();
+						init_stack.push(InitExpr.FixedArray(HeapType.Array(at), vals));
+					}
+				}
+				ARRAY_NEW_DATA => {
+					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if elem is immutable?
+					var at = parser.readArrayType();
+					if (at == null) return;
+					var index = parser.readDataIndex();
+					if (!checkArrayIsPrimitive(at, false)) return;
+					popE(ValueType.I32);
+					popE(ValueType.I32);
+					push(ValueTypes.RefArray(false, at));
+					if (validatingInitExpr) {
+						var len = init_stack.pop();
+						var offset = init_stack.pop();
+						init_stack.push(InitExpr.ArrayNewData(HeapType.Array(at), index, offset, len));
+					}
+				}
+				ARRAY_NEW_ELEM => {
+					if (noGC(opcode)) return;
+					constExpr = true; // TODO: only if elem is immutable?
+					var at = parser.readArrayType();
+					if (at == null) return;
+					var elem = parser.readElemRef();
+					if (elem == null) return;
+					if (!ValueTypes.isAssignable(elem.elemtype, at.elem_types[0].valtype)) {
+						err_atpc().ElementTypeMismatch(at.elem_types[0].valtype, elem.elemtype);
+					}
+					popE(ValueType.I32);
+					popE(ValueType.I32);
+					push(ValueTypes.RefArray(false, at));
+					if (validatingInitExpr) {
+						var len = init_stack.pop();
+						var offset = init_stack.pop();
+						init_stack.push(InitExpr.ArrayNewElem(HeapType.Array(at), elem.elem_index, offset, len));
+					}
+				}
+				REF_I31 => {
+					if (noGC(opcode)) return;
+					constExpr = true;
+					popE(ValueType.I32);
+					push(ValueTypes.I31REF_NONNULL);
+					if (validatingInitExpr) init_stack.push(InitExpr.I31(init_stack.pop()));
+				}
+				I31_GET_S => {
+					if (noGC(opcode)) return;
+					popE(ValueTypes.I31REF);
+					push(ValueType.I32);
+				}
+				I31_GET_U => {
+					if (noGC(opcode)) return;
+					popE(ValueTypes.I31REF);
+					push(ValueType.I32);
+				}
+				REF_TEST,
+				REF_TEST_NULL => {
+					if (noGC(opcode)) return;
+					var nullable = (opcode.code == Opcode.REF_TEST_NULL.code);
+					var ht = parser.readHeapType();
+					var ref = popRef();
+					push(ValueType.I32);
+				}
+				REF_CAST,
+				REF_CAST_NULL => {
+					if (noGC(opcode)) return;
+					var nullable = (opcode.code == Opcode.REF_CAST_NULL.code);
+					var ht = parser.readHeapType();
+					var ref = popRef();
+					push(ValueType.Ref(nullable, ht));
+				}
+				BR_ON_CAST => {
+					if (noGC(opcode)) return;
+					var t = parser.readBrCastImms(), depth = t.0, t1 = t.1, t2 = t.2;
+					var target = getControl(depth);
+					if (target == null) return;
+					if (!ValueTypes.isAssignable(t2, t1)) err_atpc().IllegalCast(t1, t2);
+					ctlxfer.refS(target, opcode_pos, val_stack.top);
+					popE(t1);
+					push(t2);
+					checkAndPopArgs(labelArgs(target));
+					push(ValueType.Ref(!t2.nullable, t1.heap));
+				}
+				BR_ON_CAST_FAIL => {
+					if (noGC(opcode)) return;
+					var t = parser.readBrCastImms(), depth = t.0, t1 = t.1, t2 = t.2;
+					var target = getControl(depth);
+					if (target == null) return;
+					if (!ValueTypes.isAssignable(t2, t1)) err_atpc().IllegalCast(t1, t2);
+					ctlxfer.refS(target, opcode_pos, val_stack.top);
+					popE(t1);
+					push(ValueType.Ref(!t2.nullable, t1.heap));
+					checkAndPopArgs(labelArgs(target));
+					push(t2);
+				}
+				ANY_CONVERT_EXTERN => {
+					if (noGC(opcode)) return;
+					var nullable = popRefE(ValueTypes.EXTERNREF);
+					var at = if(nullable, ValueTypes.ANYREF, ValueTypes.ANYREF_NONNULL);
+					push(at);
+				}
+				EXTERN_CONVERT_ANY => {
+					if (noGC(opcode)) return;
+					var nullable = popRefE(ValueTypes.ANYREF);
+					var et = if(nullable, ValueTypes.EXTERNREF, ValueTypes.EXTERNREF_NONNULL);
+					push(et);
+				}
+				I32_TRUNC_SAT_F32_S => checkSignature(Opcode.I32_TRUNC_SAT_F32_S.sig);
+				I32_TRUNC_SAT_F32_U => checkSignature(Opcode.I32_TRUNC_SAT_F32_U.sig);
+				I32_TRUNC_SAT_F64_S => checkSignature(Opcode.I32_TRUNC_SAT_F64_S.sig);
+				I32_TRUNC_SAT_F64_U => checkSignature(Opcode.I32_TRUNC_SAT_F64_U.sig);
+				I64_TRUNC_SAT_F32_S => checkSignature(Opcode.I64_TRUNC_SAT_F32_S.sig);
+				I64_TRUNC_SAT_F32_U => checkSignature(Opcode.I64_TRUNC_SAT_F32_U.sig);
+				I64_TRUNC_SAT_F64_S => checkSignature(Opcode.I64_TRUNC_SAT_F64_S.sig);
+				I64_TRUNC_SAT_F64_U => checkSignature(Opcode.I64_TRUNC_SAT_F64_U.sig);
+				MEMORY_INIT => {
+					if (module.explicit_data_count < 0) err_atpc().MissingDataCount();
+					var dindex = parser.readDataIndex();
+					var mindex = parser.readMemoryIndex();
+					checkAndPopArgs(SigCache.arr_iii);
+				}
+				DATA_DROP => {
+					if (module.explicit_data_count < 0) err_atpc().MissingDataCount();
+					var index = parser.readDataIndex();
+				}
+				MEMORY_COPY => {
+					var dest = parser.readMemoryIndex();
+					var src = parser.readMemoryIndex();
+					checkAndPopArgs(SigCache.arr_iii);
+				}
+				MEMORY_FILL => {
+					var index = parser.readMemoryIndex();
+					checkAndPopArgs(SigCache.arr_iii);
+				}
+				TABLE_INIT => {
+					var elem = parser.readElemRef();
+					var dst = parser.readTableRef();
+					if (dst == null || elem == null) return;
+					if (!ValueTypes.isAssignable(elem.elemtype, dst.elemtype)) {
+						err_atpc().ElementTypeMismatch(dst.elemtype, elem.elemtype);
+					}
+					checkAndPopArgs(SigCache.arr_iii);
+				}
+				ELEM_DROP => {
+					var index = parser.readElemRef();
+				}
+				TABLE_COPY => {
+					var dst = parser.readTableRef();
+					var src = parser.readTableRef();
+					if (dst == null || src == null) return;
+					if (!ValueTypes.isAssignable(src.elemtype, dst.elemtype)) {
+						err_atpc().ElementTypeMismatch(dst.elemtype, src.elemtype);
+					}
+					checkAndPopArgs(SigCache.arr_iii);
+				}
+				TABLE_GROW => {
+					var table = parser.readTableRef();
+					if (table == null) return;
+					popE(ValueType.I32);
+					popE(table.elemtype);
+					push(ValueType.I32);
+				}
+				TABLE_SIZE => {
+					var table = parser.readTableRef();
+					push(ValueType.I32);
+				}
+				TABLE_FILL => {
+					var table = parser.readTableRef();
+					if (table == null) return;
+					popE(ValueType.I32);
+					popE(table.elemtype);
+					popE(ValueType.I32);
+				}
+				V128_LOAD_8_SPLAT => checkLoad(opcode, 0, ValueType.V128);
+				V128_LOAD_16_SPLAT => checkLoad(opcode, 1, ValueType.V128);
+				V128_LOAD_32_SPLAT => checkLoad(opcode, 2, ValueType.V128);
+				V128_LOAD_64_SPLAT,
+				V128_LOAD_8X8_S,
+				V128_LOAD_8X8_U,
+				V128_LOAD_16X4_S,
+				V128_LOAD_16X4_U,
+				V128_LOAD_32_ZERO,
+				V128_LOAD_32X2_S,
+				V128_LOAD_32X2_U,
+				V128_LOAD_64_ZERO => checkLoad(opcode, 3, ValueType.V128);
+				V128_LOAD		=> checkLoad(opcode, 4, ValueType.V128);
+				V128_STORE		=> checkStore(opcode, 4, ValueType.V128);
+				V128_LOAD_8_LANE	=> { checkLaneLoad(opcode, 0); checkLane(15); }
+				V128_STORE_8_LANE	=> { checkLaneStore(opcode, 0); checkLane(15); }
+				V128_LOAD_16_LANE	=> { checkLaneLoad(opcode, 1); checkLane(7); }
+				V128_STORE_16_LANE	=> { checkLaneStore(opcode, 1); checkLane(7); }
+				V128_LOAD_32_LANE	=> { checkLaneLoad(opcode, 2); checkLane(3); }
+				V128_STORE_32_LANE	=> { checkLaneStore(opcode, 2); checkLane(3); }
+				V128_LOAD_64_LANE	=> { checkLaneLoad(opcode, 3);  checkLane(1); }
+				V128_STORE_64_LANE	=> { checkLaneStore(opcode, 3);  checkLane(1); }
+				V128_CONST => {
+					constExpr = true;
+					var low = codeptr.read_u64();
+					var high = codeptr.read_u64();
+					push(ValueType.V128);
+					if (validatingInitExpr) init_stack.push(InitExpr.V128(low, high));
+				}
+				I8X16_SHUFFLE => {
+					checkLanes(31, 16);
+					checkSignature(opcode.sig);
+				}
+				I8X16_EXTRACTLANE_S,
+				I8X16_EXTRACTLANE_U,
+				I8X16_REPLACELANE => checkLaneAndSig(opcode, 15);
+				I16X8_EXTRACTLANE_S,
+				I16X8_EXTRACTLANE_U,
+				I16X8_REPLACELANE => checkLaneAndSig(opcode, 7);
+				I32X4_EXTRACTLANE,
+				I32X4_REPLACELANE,
+				F32X4_EXTRACTLANE,
+				F32X4_REPLACELANE => checkLaneAndSig(opcode, 3);
+				I64X2_EXTRACTLANE,
+				I64X2_REPLACELANE,
+				F64X2_EXTRACTLANE,
+				F64X2_REPLACELANE => checkLaneAndSig(opcode, 1);
+				MEMORY_ATOMIC_NOTIFY	=> check_MEMARG(opcode, 2);
+				MEMORY_ATOMIC_WAIT32	=> check_MEMARG(opcode, 4);
+				MEMORY_ATOMIC_WAIT64	=> check_MEMARG(opcode, 8);
+				ATOMIC_FENCE		=> check_ZEROB(opcode);
+				I32_ATOMIC_LOAD		=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_LOAD		=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_LOAD8_U	=> check_MEMARG(opcode, 1);
+				I32_ATOMIC_LOAD16_U	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_LOAD8_U	=> check_MEMARG(opcode, 1);
+				I64_ATOMIC_LOAD16_U	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_LOAD32_U	=> check_MEMARG(opcode, 4);
+				I32_ATOMIC_STORE	=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_STORE	=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_STORE8	=> check_MEMARG(opcode, 1);
+				I32_ATOMIC_STORE16	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_STORE8	=> check_MEMARG(opcode, 1);
+				I64_ATOMIC_STORE16	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_STORE32	=> check_MEMARG(opcode, 4);
+				I32_ATOMIC_RMW_ADD	=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_RMW_ADD	=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_RMW8_ADD_U	=> check_MEMARG(opcode, 1);
+				I32_ATOMIC_RMW16_ADD_U	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_RMW8_ADD_U	=> check_MEMARG(opcode, 1);
+				I64_ATOMIC_RMW16_ADD_U	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_RMW32_ADD_U	=> check_MEMARG(opcode, 4);
+				I32_ATOMIC_RMW_SUB	=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_RMW_SUB	=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_RMW8_SUB_U	=> check_MEMARG(opcode, 4);
+				I32_ATOMIC_RMW16_SUB_U	=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_RMW8_SUB_U	=> check_MEMARG(opcode, 8);
+				I64_ATOMIC_RMW16_SUB_U	=> check_MEMARG(opcode, 8);
+				I64_ATOMIC_RMW32_SUB_U	=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_RMW_AND	=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_RMW_AND	=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_RMW8_AND_U	=> check_MEMARG(opcode, 4);
+				I32_ATOMIC_RMW16_AND_U	=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_RMW8_AND_U	=> check_MEMARG(opcode, 8);
+				I64_ATOMIC_RMW16_AND_U	=> check_MEMARG(opcode, 8);
+				I64_ATOMIC_RMW32_AND_U	=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_RMW_OR	=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_RMW_OR	=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_RMW8_OR_U	=> check_MEMARG(opcode, 1);
+				I32_ATOMIC_RMW16_OR_U	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_RMW8_OR_U	=> check_MEMARG(opcode, 1);
+				I64_ATOMIC_RMW16_OR_U	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_RMW32_OR_U	=> check_MEMARG(opcode, 4);
+				I32_ATOMIC_RMW_XOR	=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_RMW_XOR	=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_RMW8_XOR_U	=> check_MEMARG(opcode, 1);
+				I32_ATOMIC_RMW16_XOR_U	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_RMW8_XOR_U	=> check_MEMARG(opcode, 1);
+				I64_ATOMIC_RMW16_XOR_U	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_RMW32_XOR_U	=> check_MEMARG(opcode, 4);
+				I32_ATOMIC_RMW_XCHG	=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_RMW_XCHG	=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_RMW8_XCHG_U	=> check_MEMARG(opcode, 4);
+				I32_ATOMIC_RMW16_XCHG_U	=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_RMW8_XCHG_U	=> check_MEMARG(opcode, 8);
+				I64_ATOMIC_RMW16_XCHG_U	=> check_MEMARG(opcode, 8);
+				I64_ATOMIC_RMW32_XCHG_U	=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_RMW_CMPXCHG	=> check_MEMARG(opcode, 4);
+				I64_ATOMIC_RMW_CMPXCHG	=> check_MEMARG(opcode, 8);
+				I32_ATOMIC_RMW8_CMPXCHG_U	=> check_MEMARG(opcode, 1);
+				I32_ATOMIC_RMW16_CMPXCHG_U	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_RMW8_CMPXCHG_U	=> check_MEMARG(opcode, 1);
+				I64_ATOMIC_RMW16_CMPXCHG_U	=> check_MEMARG(opcode, 2);
+				I64_ATOMIC_RMW32_CMPXCHG_U	=> check_MEMARG(opcode, 4);
+				CONT_NEW => {
+					var cont_decl = parser.readCont();
+					if (cont_decl == null) return;
+					popE(ValueTypes.Ref(true, cont_decl.sig));
+					val_stack.push(ValueTypes.Ref(false, cont_decl));
+				}
+				CONT_BIND => {
+					var input_cont = parser.readCont();
+					if (input_cont == null) return;
+					var output_cont = parser.readCont();
+					if (output_cont == null) return;
+
+					popE(ValueTypes.Ref(true, input_cont));
+
+					var input_sig = input_cont.sig;
+					var output_sig = output_cont.sig;
+
+					var source_length = input_sig.params.length;
+					var target_length = output_sig.params.length;
+					if (source_length < target_length) {
+						err_atpc().IllegalContinuationBind(input_cont, output_cont);
+						return;
+					}
+
+					var n_binds = source_length - target_length;
+					var applied_args = Arrays.range(input_sig.params, 0, n_binds);
+					var remain_args = Arrays.range(input_sig.params, n_binds, source_length);
+
+					if (
+						!Arrays.allTrue(remain_args, output_sig.params, ValueTypes.isCompatibleParamType) ||
+						!Arrays.allTrue(input_sig.results, output_sig.results, ValueTypes.isCompatibleReturnType)
+					) {
+						err_atpc().IllegalContinuationBind(input_cont, output_cont);
+						return;
+					}
+
+					// Values on the stack matches the consumed arguments `applied_args`.
+					checkAndPopArgs(applied_args);
+					val_stack.push(ValueTypes.Ref(false, output_cont));
+				}
+				SUSPEND => {
+					var tag = parser.readTagRef();
+					if (tag == null) return;
+					var tag_sig = module.heaptypes[tag.sig_index];
+					if (!SigDecl.?(tag_sig)) {
+						err_atpc().ExpectedSignature(tag_sig);
+						return;
+					}
+
+					checkSignature(SigDecl.!(tag_sig));
+				}
+				RESUME => {
+					var ct = parser.readCont();
+					if (ct == null) return;
+					popE(ValueTypes.Ref(true, ct));
+					checkSignature(ct.sig);
+
+					readAndCheckContHandlerTable(ct);
+				}
+				RESUME_THROW => {
+					var ct = parser.readCont();
+					if (ct == null) return;
+					popE(ValueTypes.Ref(true, ct));
+
+					var thrown_tag = parser.readTagRef();
+					if (thrown_tag == null) return;
+					checkAndPopArgs(thrown_tag.fields);
+
+					readAndCheckContHandlerTable(ct);
+				}
+
+				INVALID => {
+					codeptr.at(opcode_pos);
+					err_atpc().InvalidOpcode(codeptr.read1(), codeptr.read_uleb32());
+				}
+				_ => {
+					if (opcode.sig != null) {
+						checkSignature(opcode.sig);
+						if (Trace.validation) traceStack(false);
+					} else {
+						codeptr.at(opcode_pos);
+						err_atpc().InvalidOpcode(codeptr.read1(), codeptr.read_uleb32());
+					}
+				}
+			}
+			if (Trace.validation) traceStack(false);
+			if (validatingInitExpr && !constExpr) err_atpc().UnexpectedOpcodeInInit(opcode.prefix, opcode.code);
+		}
+	}
+	def startExHandler() -> (int, int) {
+		if (ctl_top.try_end < 0) ctl_top.try_end = opcode_pos;
+		return (ctl_top.start_pos + 1 - func_start_pos, ctl_top.try_end - func_start_pos);
+	}
+	def findExSlot(target: ControlEntry) -> (int, bool) {
+		var ex_slot = -1, found = false;
+		for (i < ctl_stack.top) { // XXX: linear search for exception slot
+			var ctl = ctl_stack.elems[i];
+			if (ctl.start_opcode == Opcode.CATCH.code || ctl.start_opcode == Opcode.CATCH_ALL.code) ex_slot++;
+			if (ctl == target) {
+				found = true;
+				break;
+			}
+		}
+		var ex_slots = ex_slot + 1;
+		if (ex_slots > func.num_ex_slots) func.num_ex_slots = u16.!(ex_slots);
+		return (ex_slot, found);
+	}
+	def noGC(opcode: Opcode) -> bool {
+		return !checkExtension(Extension.GC, opcode);
+	}
+	def checkInit(index: u32) {
+		if (index >= init_status.length) return;
+		var i = int.!(index);
+		if (init_status[i] == InitStatus.UNINIT) err_atpc().UninitializedLocal(index);
+	}
+	def setInit(index: u32) {
+		if (index >= init_status.length) return;
+		var i = int.!(index);
+		if (init_status[i] == InitStatus.UNINIT) {
+			init_status[i] = InitStatus.INIT;
+			ctl_top.undo_init_list = List.new(i, ctl_top.undo_init_list);
+		}
+	}
+	def resetInit() {
+		for (l = ctl_top.undo_init_list; l != null; l = l.tail) init_status[l.head] = InitStatus.UNINIT;
+		ctl_top.undo_init_list = null;
+	}
+	def checkSignature(sig: SigDecl) {
+		var p = sig.params, r = sig.results;
+		if (p.length > 0) checkAndPopArgs(p);
+		if (r.length > 0) pushTypes(r);
+	}
+	def checkExtension(ext: Extension, opcode: Opcode) -> bool {
+		if (extensions != (extensions | ext)) {
+			err_atpc().OpcodeRequiresExtension(opcode, ext);
+			return false;
+		}
+		return true;
+	}
+	def setUnreachable() {
+		if (ctl_top == null) return;
+		ctl_top.reachable = false;
+		val_stack.top = ctl_top.val_stack_top;
+	}
+	def checkLoad(opcode: Opcode, max_align: u32, result: ValueType) {
+		var indexType = checkAlignAndGetIndexType(max_align);
+		popE(indexType);
+		push(result);
+	}
+	def checkStore(opcode: Opcode, max_align: u32, val: ValueType) {
+		var indexType = checkAlignAndGetIndexType(max_align);
+		popE(val);
+		popE(indexType);
+	}
+	def checkLaneLoad(opcode: Opcode, max_align: u32) {
+		var indexType = checkAlignAndGetIndexType(max_align);
+		popE(ValueType.V128);
+		popE(indexType);
+		push(ValueType.V128);
+	}
+	def checkLaneStore(opcode: Opcode, max_align: u32) {
+		var indexType = checkAlignAndGetIndexType(max_align);
+		popE(ValueType.V128);
+		popE(indexType);
+	}
+	def checkAlignAndGetIndexType(max_align: u32) -> ValueType {
+		var memarg = parser.readMemoryArg();
+		var align = memarg.flags;
+		if (align > max_align) err_atpc().IllegalAlignment(max_align, align);
+		var indexType: ValueType = ValueType.I32;
+		if (memarg.memory_index < module.memories.length) {
+			indexType = module.memories[memarg.memory_index].indexType;
+		}
+		return indexType;
+	}
+	def checkArrayIsMutable(at: ArrayDecl, pop: bool) -> bool {
+		if (at == null) return false;
+		for (et in at.elem_types) {
+			if (!et.mutable) {
+				err_atpc().IllegalAssignmentToImmutableArray(ValueType.Ref(true, HeapType.Array(at)));
+				return false;
+			}
+			if (pop) popE(et.valtype);
+		}
+		return true;
+	}
+	def checkArrayIsPrimitive(at: ArrayDecl, pop: bool) -> bool {
+		if (at == null) return false;
+		for (et in at.elem_types) {
+			if (!ValueTypes.isPrimitive(et.valtype)) err_atpc().IllegalNonPrimitiveArray(at);
+			if (pop) popE(et.valtype);
+		}
+		return true;
+	}
+	def checkLane(max: u32) {
+		var lane = codeptr.read1();
+		if (lane > max) err_atpc().IllegalLane(max, lane);
+	}
+	def checkLanes(max: u32, num_lane: u32) {
+		for (i = 0; i < num_lane; i++) {
+			checkLane(max);
+		}
+	}
+	def checkLaneAndSig(opcode: Opcode, max: u32) {
+		checkLane(max);
+		checkSignature(opcode.sig);
+	}
+	def check_MEMARG(opcode: Opcode, max_align: u32) {
+		var indexType = checkAlignAndGetIndexType(max_align);
+		checkSignature(opcode.sig);
+	}
+	def check_ZEROB(opcode: Opcode) {
+		var pos = codeptr.pos;
+		var b = codeptr.read1();
+		if (b != 0) err_atpos(pos).ExpectedAtomicFenceZeroByte(b);
+		checkSignature(opcode.sig);
+	}
+	def traceOpcode() {
+		var pc = opcode_pos - ctlxfer.start_pos;
+		instrTracer.putPcAndInstr(OUT, module, func, pc, true);
+		OUT.ln();
+	}
+	def checkTargetArgs(target: ControlEntry) {
+		var p = labelArgs(target);
+		if (p == null || p.length == 0) return;
+		var onStack = val_stack.top - ctl_top.val_stack_top;
+		var start = val_stack.top - p.length, missing = p.length - onStack;
+		if (missing < 0) missing = 0;
+		for (i = p.length - 1; i >= missing; i--) {
+			var expected = p[i];
+			var t = val_stack.elems[start + i];
+			if (!ValueTypes.isAssignable(t, expected)) err_atpc().ExpectedType(expected, t);
+		}
+		if (missing > 0) {
+			if (ctl_top.reachable) return err_atpc().EmptyValueStackExpecting(p[missing - 1]);
+		}
+	}
+	def checkTargetCatch(i: int, c: Catch, target: ControlEntry) {
+		var p = labelArgs(target);
+		if (p == null) return;
+		var ct = if(c.tag == null, SigCache.arr_v, c.tag.fields);
+		if (c.exnref) ct = Arrays.append(ValueTypes.EXNREF, ct); // XXX: avoid array copy
+		if (ct.length != p.length) return err_atpc().ArityMismatchInHandler("catch", i, p.length, ct.length);
+		for (j < p.length) {
+			if (!ValueTypes.isAssignable(ct[j], p[j])) err_atpc().TypeMismatchInHandler("catch", i, p[i], ct[i]);
+		}
+	}
+	def readAndCheckContHandlerTable(cont: ContDecl) {
+		var handlers = parser.readContHandlers();
+		var sidetable_pos = ctlxfer.sidetable.length;
+		for (i < handlers.length) {
+			var handler = handlers[i];
+			var target = getControl(handler.depth);
+			if (target == null) return;
+			checkContHandle(i, handler.tag, cont, target);
+			ctlxfer.refC(target, handler.tag, false);
+
+			var sidetable_entry = sidetable_pos + (i * Sidetable_CatchEntry.size / 4); // TODO: entry size
+			var info = ExHandlerInfo.Sidetable(false, sidetable_entry);
+			var tag_index = handler.tag.tag_index;
+			var resume_pos = opcode_pos - func_start_pos;
+			resume_handlers.put(ExHandlerEntry(tag_index, resume_pos, resume_pos + 1, info));
+		}
+	}
+	def checkContHandle(i: int, tag: TagDecl, cont: ContDecl, target: ControlEntry) {
+		var p = labelArgs(target);
+		if (p == null) return;
+		if (p.length == 0) {
+			err_atpc().ZeroArityInContHandler(i);
+			return;
+		}
+
+		var tag_type = module.heaptypes[tag.sig_index];
+		if (!SigDecl.?(tag_type)) return err_atpc().ExpectedSignature(tag_type);
+		var tag_sig = SigDecl.!(tag_type);
+
+		// p := [<output from label>, (ref null? label_cont)]
+		// [<input to tag>] <: [<output from label>]
+		var n_label_res = p.length - 1;
+		if (tag_sig.params.length != n_label_res) {
+			err_atpc().ArityMismatchInHandler("resume", i, n_label_res, tag_sig.params.length);
+			return;
+		}
+		for (j < n_label_res) {
+			if (!ValueTypes.isAssignable(p[j], tag_sig.params[j])) {
+				return err_atpc().TypeMismatchInHandler("resume", i, tag_sig.params[i], p[i]);
+			}
+		}
+
+		// getting continuation receiver type from label
+		var label_cont = p[p.length - 1];
+		var cont_ht: HeapTypeDecl;
+		match(label_cont) {
+			Ref(nullable, heap) => cont_ht = heap.decl();
+			_ => return err_atpc().ExpectedRefType(label_cont);
+		}
+		if (!ContDecl.?(cont_ht)) return err_atpc().ExpectedContinuation(cont_ht);
+		var lcont = ContDecl.!(cont_ht);
+
+		// TODO: verify if structural assignment check is appropriate here
+		// ([tag output] -> [cont output]) <: label_cont
+		var tag_output = tag_sig.results;
+		var cont_output = cont.sig.results;
+		if (
+			!Arrays.allTrue(tag_output, lcont.sig.params, ValueTypes.isCompatibleParamType) ||
+			!Arrays.allTrue(cont_output, lcont.sig.results, ValueTypes.isCompatibleReturnType)
+		) {
+			return err_atpc().IllegalContinuationReceiverInHandler(i);
+		}
+	}
+	def checkAndPopArgs(p: Array<ValueType>) {
+		for (i = p.length - 1; i >= 0; i--) popE(p[i]);
+	}
+	def checkAndPopFields(p: Array<StorageType>) {
+		for (i = p.length - 1; i >= 0; i--) popE(p[i].valtype);
+	}
+	def checkArgsAndTransfer() {
+		var p = ctl_top.results;
+		var count = val_stack.top - ctl_top.val_stack_top;
+		if (count > p.length || (ctl_top.reachable && count < p.length)) {
+			err_atpc().ArityMismatchAtFallthru(p.length, count);
+		}
+		for (i = p.length - 1; i >= 0; i--) popE(p[i]);
+		val_stack.top = ctl_top.val_stack_top;
+		val_stack.pusha(p);
+	}
+
+	def push(v: ValueType) {
+		val_stack.push(v);
+	}
+	def popE(expected: ValueType) {
+		if (val_stack.top <= ctl_top.val_stack_top) {
+			if (ctl_top.reachable) {
+				err_atpc().EmptyValueStackExpecting(expected);
+			}
+			return; // unreachable or already signalled an error
+		}
+		var t = val_stack.pop();
+		if (!ValueTypes.isAssignable(t, expected)) {
+			err_atpc().ExpectedType(expected, t);
+		}
+	}
+	def checkReturnSig(results: Array<ValueType>) {
+		var expected = sig.results;
+		if (results.length != expected.length) {
+			err_atpc().ReturnArityMismatch(expected.length, results.length);
+			return;
+		}
+		for (i < results.length) {
+			var t = results[i], e = expected[i];
+			if (!ValueTypes.isAssignable(t, e)) {
+				err_atpc().ReturnSigMismatch(i, e, t);
+			}
+		}
+	}
+	def popAny() -> (ValueType, bool) {
+		if (val_stack.top <= ctl_top.val_stack_top) {
+			if (ctl_top.reachable) err_atpc().EmptyValueStack();
+			return (ValueType.BOTTOM, false);
+		}
+		return (val_stack.pop(), true);
+	}
+	def popRef() -> (ValueType, bool) {
+		var t = popAny();
+		if (t.1 && !ValueTypes.isRef(t.0)) err_atpc().ExpectedRefType(t.0);
+		return t;
+	}
+	def popRefE(expected: ValueType) -> bool {
+		if (val_stack.top <= ctl_top.val_stack_top) {
+			if (ctl_top.reachable) {
+				err_atpc().EmptyValueStackExpecting(expected);
+			}
+			return true; // unreachable or already signalled an error
+		}
+		var t = val_stack.pop();
+		if (!ValueTypes.isAssignable(t, expected)) {
+			err_atpc().ExpectedType(expected, t);
+		}
+		match (t) {
+			Ref(nullable, ht) => return nullable;
+			_ => return true;
+		}
+	}
+	def asNonNullRefType(t: ValueType) -> ValueType {
+		match (t) {
+			Ref(nullable, heap) => return ValueType.Ref(false, heap);
+			_ => err_atpc().ExpectedRefType(t);
+		}
+		return t;
+	}
+	def pushTypes(r: Array<ValueType>) {
+		val_stack.pusha(r);
+	}
+	def checkArgsAndPushControl(opcode: Opcode, params: Array<ValueType>, results: Array<ValueType>) -> ControlEntry {
+		checkAndPopArgs(params);
+		pushTypes(params);
+		return pushControl(opcode.code, params, results, val_stack.top - params.length);
+	}
+	def pushControl(opcode: byte, params: Array<ValueType>, results: Array<ValueType>, val_stack_top: int) -> ControlEntry {
+		var ctl = ctl_stack.next();
+		if (ctl != null) { // FAST: reuse previous ControlEntry object
+			ctl_stack.top++;
+		} else { // allocate and cache new ControlEntry object
+			ctl = ControlEntry.new();
+			ctl_stack.push(ctl);
+		}
+		ctl_top = ctl;
+		ctl.start_pos = opcode_pos;
+		ctl.delegate_pos = opcode_pos;
+		ctl.start_opcode = opcode;
+		ctl.sidetable_pos = -1;
+		ctl.params = params;
+		ctl.results = results;
+		ctl.val_stack_top = val_stack_top;
+		ctl.reachable = true;
+		ctl.first_ref = -1;
+		ctl.else_ref = -1;
+		ctl.undo_init_list = null;
+		return ctl;
+	}
+	def getControl(depth: u32) -> ControlEntry {
+		if (depth >= ctl_stack.top) {
+			err_atpc().OobLabel(depth, ctl_stack.top);
+			return null;
+		}
+		var result = ctl_stack.elems[ctl_stack.top - int.!(depth) - 1];
+		if (Trace.validation) {
+			OUT.put2("    label: depth=%d @+%d", depth, result.start_pos - ctlxfer.start_pos).ln();
+		}
+		return result;
+	}
+	def getLocalType(index: u32) -> ValueType {
+		if (index < locals.length) return locals[int.view(index)];
+		err_atpc().OobLocalIndex(index, locals.length);
+		return ValueType.BOTTOM;
+	}
+	def traceStack(before: bool) {
+		if (before) OUT.put1("    stack: %d| ", val_stack.top);
+		else        OUT.put1("       ==> %d| ", val_stack.top);
+
+		var start = val_stack.top - 5;
+		if (start > 0) OUT.puts("... ");
+		else start = 0;
+		for (i = start; i < val_stack.top; i++) {
+			var e = val_stack.elems[i];
+			e.render(OUT);
+			OUT.putc(' ');
+		}
+		OUT.ln();
+	}
+}
+def labelArgs(target: ControlEntry) -> Array<ValueType> {
+	if (target.start_opcode == Opcode.LOOP.code) return target.params;
+	else return target.results;
+}
+type CodeValidatorResult {
+	case Ok {}
+	case Error(error: WasmError, pc: int, msg: string) { }
+}
+private enum InitStatus {
+	UNINIT,
+	INIT
+}
+// An entry in the control stack, exposed guts.
+class ControlEntry {
+	var start_pos: int;
+	var delegate_pos: int;
+	var start_opcode: byte;
+	var sidetable_pos: int;
+	var params: Array<ValueType>;
+	var results: Array<ValueType>;
+	var reachable = true;
+	var val_stack_top: int;
+	var try_end: int;
+	var first_ref: int = -1;
+	var else_ref: int = -1;
+	var undo_init_list: List<int>;
+	var catches: Array<Catch>;
+}
+// Utility for building the sidetable for a function, which contains control transfer information.
+class SidetableBuilder {
+	def sidetable = Vector<i32>.new();
+	var start_pos: int;
+	def reset(start_pos: int) {
+		this.start_pos = start_pos;
+		this.sidetable.resize(0);
+	}
+	// Emit a control entry that references {target} from the pc position {pc}.
+	def ref0(target: ControlEntry, pos: int) {
+		refV(target, pos, 0, 0);
+	}
+	// Emit a control entry for an else that references the else label of {target} from {pos}.
+	def refElse(target: ControlEntry, pos: int) {
+		var pc = rel(pos);
+		var stp = sidetable.length;
+		if (Trace.validation) {
+			OUT.put3("    refElse(@+%d (stp=%d) to +%d.else", pc, stp, rel(target.start_pos));
+			OUT.ln();
+		}
+		target.else_ref = stp;
+		Sidetables.putBrEntry(sidetable, pc, 0, 0, -1);
+	}
+	// Bind the else label for {target} at {pos}, resolving references to it.
+	def bindElse(target: ControlEntry, pos: int) {
+		bind0(target, target.else_ref, pos, sidetable.length);
+		target.else_ref = -1;
+	}
+	// Emit a sidetable entry for a branch to {target} from {pos} with stack top {val_stack_top}.
+	def refS(target: ControlEntry, pos: int, val_stack_top: int) {
+		var valcount = labelArgs(target).length;
+		var popcount = val_stack_top - valcount - target.val_stack_top;
+		refV(target, pos, valcount, u23.view(popcount));
+	}
+	def refV(target: ControlEntry, pos: int, valcount: int, popcount: int) {
+		var pc = rel(pos);
+		var stp = sidetable.length;
+		if (Trace.validation) {
+			OUT.put3("    refV(@+%d (stp=%d) to +%d.label, ", pc, stp, rel(target.start_pos));
+			OUT.put2("valcount=%d, popcount=%d)",	valcount, popcount);
+			OUT.ln();
+		}
+		Sidetables.putBrEntry(sidetable, pc, valcount, popcount, target.first_ref);
+		target.first_ref = stp;
+	}
+	// Emit a sidetable entry for a catch entry.
+	def refC(target: ControlEntry, tag: TagDecl, exnref: bool) {
+		var handler_pc = 0;
+		var stp = sidetable.length;
+		if (Trace.validation) {
+			OUT.put3("    refC(@+pc tag=%d exnref=%z vsp=%d", if(tag != null, tag.tag_index, -1), exnref, target.val_stack_top);
+			OUT.ln();
+		}
+		Sidetables.putCatchEntry(sidetable, handler_pc, target.val_stack_top, target.first_ref);
+		target.first_ref = stp;
+	}
+	// Bind the label for {target} at {pos} and {sidetable_pos} and resolve references to it.
+	def bind(target: ControlEntry, pos: int, sidetable_pos: int) {
+		bind0(target, target.first_ref, pos, sidetable_pos);
+		target.first_ref = -1;
+	}
+	def bind0(target: ControlEntry, stp: int, pos: int, sidetable_pos: int) {
+		target.sidetable_pos = sidetable_pos;
+		var pc = rel(pos);
+		while (stp >= 0) {
+			var ni = sidetable[stp + Sidetables.dstp_pos];
+			if (Trace.validation) OUT.put2("    resolve(stp=%d, next=%d)", stp, ni).ln();
+			var pos = sidetable[stp + Sidetables.dpc_pos];
+			var pc_delta = pc - pos;
+			sidetable[stp + Sidetables.dpc_pos] = pc_delta;
+			sidetable[stp + Sidetables.dstp_pos] = sidetable_pos - stp;
+
+			if (Trace.validation) {
+				OUT.put3("    resolve(@+%d to +%d) (\xCE\x94stp=%d)", pos, pc, sidetable_pos - stp);
+				OUT.ln();
+			}
+			stp = ni;
+		}
+	}
+	def rethrow(ex_slot: int, popcount: int) {
+		if (Trace.validation) OUT.put2("    rethrow ex_slot=%d popcount=%d", ex_slot, popcount).ln();
+		sidetable.put(ex_slot).put(0).put(popcount).put(0); // XXX: only need 1 entry for rethrow
+	}
+	def rel(pos: int) -> int {
+		return pos - start_pos;
+	}
+	def extract() -> Sidetable {
+		return if(sidetable.length > 0, Sidetable(sidetable.extract()), Sidetables.NO_SIDETABLE);
+	}
+}
+
+def stackDelta(func_sig: SigDecl, opcode: Opcode, parser: WasmParser) -> (int, int) {
+	var sig = opcode.sig;
+	if (sig != null) return (sig.params.length, sig.results.length);
+	def noFallThru = -1;
+	def error = (-1, -1);
+	match (opcode) {
+		INVALID, CRASH_EXEC, CRASH_COMPILER =>				return (0, noFallThru);
+		UNREACHABLE, BR, DELEGATE =>					return (0, noFallThru);
+		ELSE, CATCH, CATCH_ALL, RETHROW => 				return (0, noFallThru);
+		THROW_REF, BR_TABLE => 						return (1, noFallThru);
+		BR_ON_NULL, BR_ON_CAST, BR_ON_CAST_FAIL =>			return (1, 1);
+		BR_IF, BR_ON_NON_NULL =>					return (1, 0);
+		END =>								return (0, 0);
+		DROP =>								return (1, 0);
+		SELECT =>							return (3, 1);
+		LOCAL_GET =>							return (0, 1);
+		LOCAL_SET =>							return (1, 0);
+		LOCAL_TEE =>							return (1, 1);
+		GLOBAL_GET =>							return (0, 1);
+		GLOBAL_SET =>							return (1, 0);
+		TABLE_GET =>							return (1, 0);
+		TABLE_SET =>							return (2, 0);
+		MEMORY_SIZE =>							return (0, 1);
+		MEMORY_GROW =>							return (1, 1);
+		I32_CONST, I64_CONST, F32_CONST, F64_CONST, REF_NULL =>		return (0, 1);
+		REF_IS_NULL =>							return (1, 1);
+		REF_FUNC =>							return (0, 1);
+		REF_AS_NON_NULL =>						return (1, 1);
+		REF_EQ =>							return (2, 1);
+		STRUCT_NEW_DEFAULT =>						return (0, 1);
+		STRUCT_GET, STRUCT_GET_S, STRUCT_GET_U =>			return (1, 1);
+		STRUCT_SET =>							return (2, 0);
+		ARRAY_NEW_DEFAULT =>						return (1, 1);
+		ARRAY_GET, ARRAY_GET_S, ARRAY_GET_U =>				return (2, 1);
+		ARRAY_SET =>							return (3, 1);
+		ARRAY_LEN =>							return (1, 1);
+		ARRAY_FILL =>							return (3, 0);
+		ARRAY_COPY =>							return (5, 0);
+		ARRAY_INIT_DATA =>						return (4, 0);
+		ARRAY_INIT_ELEM =>						return (4, 0);
+		ARRAY_NEW_DATA =>						return (3, 1);
+		ARRAY_NEW_ELEM =>						return (2, 1);
+		REF_I31 =>							return (1, 1);
+		I31_GET_S =>							return (1, 1);
+		I31_GET_U =>							return (1, 1);
+		REF_TEST, REF_TEST_NULL =>					return (1, 1);
+		REF_CAST, REF_CAST_NULL =>					return (1, 1);
+		ANY_CONVERT_EXTERN =>						return (1, 1);
+		EXTERN_CONVERT_ANY =>						return (1, 1);
+		MEMORY_INIT =>							return (3, 0);
+		MEMORY_COPY =>							return (3, 0);
+		MEMORY_FILL =>							return (3, 0);
+		TABLE_INIT =>							return (3, 0);
+		TABLE_COPY =>							return (3, 0);
+		TABLE_GROW =>							return (2, 0);
+		TABLE_SIZE =>							return (0, 1);
+		TABLE_FILL =>							return (3, 0);
+		CONT_NEW =>							return (1, 1);
+
+		BLOCK, LOOP, TRY, TRY_TABLE => {
+			var pr = parser.readBlockType();
+			return (pr.0.length, pr.0.length); // consumes and leaves params on stack
+		}
+		IF => {
+			var pr = parser.readBlockType();
+			return (1 + pr.0.length, pr.0.length);
+		}
+		THROW => {
+			var tag = parser.readTagRef();
+			if (tag == null) return error;
+			return (tag.fields.length, noFallThru);
+		}
+		RETURN => {
+			return (func_sig.results.length, noFallThru);
+		}
+		CALL => {
+			var func = parser.readFuncRef();
+			if (func == null) return error;
+			return (func.sig.params.length, func.sig.results.length);
+		}
+		CALL_INDIRECT => {
+			var sig = parser.readSigRef();
+			if (sig == null) return error;
+			var unused_ = parser.readTableImm();
+			return (1 + sig.params.length, sig.results.length);
+		}
+		RETURN_CALL => {
+			var func = parser.readFuncRef();
+			if (func == null) return error;
+			return (func.sig.params.length, noFallThru);
+		}
+		RETURN_CALL_INDIRECT => {
+			var sig = parser.readSigRef();
+			if (sig == null) return error;
+			var unused_ = parser.readTableImm();
+			return (1 + sig.params.length, noFallThru);
+		}
+		CALL_REF => {
+			var sig = parser.readSigRef();
+			if (sig == null) return error;
+			return (1 + sig.params.length, sig.results.length);
+		}
+		RETURN_CALL_REF => {
+			var sig = parser.readSigRef();
+			if (sig == null) return error;
+			return (1 + sig.params.length, noFallThru);
+		}
+		SELECT_T => {
+			var at = parser.readValueTypes("select count", parser.limits.max_num_select_results);
+			// arity == 1 + 2 * at.length
+			if (at.length == 0) return error;
+			return (1 + 2 * at.length, at.length);
+		}
+		STRUCT_NEW => {
+			var st = parser.readStructType();
+			if (st == null) return error;
+			return (st.field_types.length, 1);
+		}
+		ARRAY_NEW => {
+			var at = parser.readArrayType();
+			if (at == null) return error;
+			return (1 + at.elem_types.length, 1);
+		}
+		ARRAY_NEW_FIXED => {
+			var at = parser.readArrayType();
+			if (at == null) return error;
+			var size = parser.readU32_i("array size", parser.limits.max_array_length);
+			return (1 + size, 1);
+		}
+		CONT_BIND => {
+			var input_cont = parser.readCont();
+			if (input_cont == null) return error;
+			var output_cont = parser.readCont();
+			if (output_cont == null) return error;
+			return (1 + input_cont.sig.params.length - output_cont.sig.params.length, 1);
+		}
+		SUSPEND => {
+			var tag = parser.readTagRef();
+			if (tag == null) return error;
+			var tag_sig = parser.module.heaptypes[tag.sig_index];
+			if (!SigDecl.?(tag_sig)) return error;
+			var sig = SigDecl.!(tag_sig);
+			return (sig.params.length, sig.results.length);
+		}
+		RESUME => {
+			var ct = parser.readCont();
+			if (ct == null) return error;
+			return (1 + ct.sig.params.length, ct.sig.results.length);
+		}
+		RESUME_THROW => {
+			var ct = parser.readCont();
+			if (ct == null) return error;
+			var tag = parser.readTagRef();
+			var tag_sig = parser.module.heaptypes[tag.sig_index];
+			if (!SigDecl.?(tag_sig)) return error;
+			var sig = SigDecl.!(tag_sig);
+			return (sig.params.length, ct.sig.results.length);
+		}
+		_ => {
+			return error;
+		}
+	}
+}

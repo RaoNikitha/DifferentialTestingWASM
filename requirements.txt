@@ -1,0 +1,4 @@
+langchain-community==0.0.12
+pandas
+openai
+pymupdf
