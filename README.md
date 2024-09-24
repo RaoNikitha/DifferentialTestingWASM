@@ -2,9 +2,9 @@
 
 ## Setting up your environment
 
-Run the following command to setup the environment and install all the dependencies listed in `requirements.txt`.
+Run the following command to setup the environment and install all the dependencies listed in `/code/requirements.txt`.
 ```
-./setup_env.sh
+./code/setup_env.sh
 ```
 
 Set the environment variable with the OpenAI API key. 
@@ -13,7 +13,7 @@ export OPENAI_API_KEY="<ENTER OPENAI API KEY>"
 ```
 
 ## 1. Extract Relevant Context
-All the scripts to extract relevant context can be found under `./extract_context/` directory.
+All the scripts to extract relevant context can be found under `/code/extract_context/` directory.
 
 ### 1.1. Extract list of instructions and map instructions to relevant human written tests. 
 
@@ -42,7 +42,7 @@ python3 main_separate_human_tests.py
 ```
 
 ## 2. Test Generation
-The test generation framework includes two main steps.
+The test generation framework includes two main steps. The scripts can be found in `/code/test_generation/`
 
 ### 2.1 Generate test descriptions
 First, we use all the extracted information as context to prompt the LLM to generate descriptions of what each test should do.
@@ -57,14 +57,14 @@ python3 main_test_generation.py
 ```
 
 ## 3. Utils
-The data loaders and other data specific utilities are in `/utils/data_utils.py`
+The data loaders and other data specific utilities are in `/code/utils/data_utils.py`
 
-The model specific utilities are in `/utils/model_utils.py`
+The model specific utilities are in `/code/utils/model_utils.py`
 
-All the prompts are in `/utils/prompt_utils.py`
+All the prompts are in `/code/utils/prompt_utils.py`
 
 ## 4. Evaluation
-
+All the evaluation scripts are under `/code/evaluation/`
 ### 4.1. Setup instructions for each WASM implementation
 We setup the four different WASM implementations by following the guidelines in the respective repositories.
 - [WASM Spec implementation](https://github.com/WebAssembly/spec)
@@ -115,9 +115,9 @@ python3 get_diff_tests.py
 
 ## Misc
 
-* `/context/` has all the relevant context including the source code files, extracted constraints, bug classes and their descriptions, extracted code context (includes relevant code snippets for instruction, and list of differences between the implementations), and the generated test descriptions.  
+* `/code/context/` has all the relevant context including the source code files, extracted constraints, bug classes and their descriptions, extracted code context (includes relevant code snippets for instruction, and list of differences between the implementations), and the generated test descriptions.  
 
-* `/human_written_tests/WebAssembly/processed_control_flow_validation/` has both the relevant human written test files as well as the processed tests files (See [section 1.4](#14-preprocess-human-written-tests)).
+* `/code/human_written_tests/WebAssembly/processed_control_flow_validation/` has both the relevant human written test files as well as the processed tests files (See [section 1.4](#14-preprocess-human-written-tests)).
 
 
 ## References

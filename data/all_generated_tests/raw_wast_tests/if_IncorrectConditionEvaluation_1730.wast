@@ -1,0 +1,3 @@
+;; 1. **Simple Conditional Check with `br_if` Branching**: Create a test that uses a simple condition to trigger a `br_if` branch where the condition should evaluate to true (non-zero) and ensure the branch is taken. Verify if one implementation incorrectly bypasses the branch regardless of the condition.
+
+(assert_invalid (module (func $simple-br_if-test (result i32) (local i32) (i32.const 10) (if (result i32) (i32.const 1) (then (i32.const 20)) (else (br_if 0 (local.get 0))) (end)) (i32.const 0))) "type mismatch")

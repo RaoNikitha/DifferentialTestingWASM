@@ -1,0 +1,3 @@
+;; 5. **Test with Multiple `nop` Instructions in Sequence:**    - Use a sequence of multiple `nop` instructions in a row and check that the CFG remains consistent and transitions smoothly to subsequent instructions.    - **Constraint Tested:** Asserts that consecutive `nop` instructions do not affect control flow.
+
+ ;; (module (func (nop) (nop) (nop) (nop) (nop) (i32.const 1)) (export "test" (func 0)))

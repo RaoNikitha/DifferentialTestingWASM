@@ -1,0 +1,25 @@
+;; 7. Test a scenario where a main function contains `call` instructions to multiple other functions, each containing `nop` before their respective `return` instructions, to verify that the return values and control flow of each called function are correct.
+
+(assert_return
+  (module
+    (func $func1 (result i32)
+      (nop)
+      (return (i32.const 1))
+    )
+    (func $func2 (result i32)
+      (nop)
+      (return (i32.const 2))
+    )
+    (func $func3 (result i32)
+      (nop)
+      (return (i32.const 3))
+    )
+    (func (export "main") (result i32)
+      (call $func1)
+      (call $func2)
+      (call $func3)
+      (i32.add)
+    )
+  )
+  (invoke "main") (i32.const 6)
+)

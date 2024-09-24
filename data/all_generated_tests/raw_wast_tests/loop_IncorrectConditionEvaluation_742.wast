@@ -1,0 +1,35 @@
+;; 3. **Test Description**: Create a loop that sums up integers from 1 to 10 using a `br_if` instruction to continue the loop as long as the sum is less than 55. Verify the sum is accurate.    - **Constraint**: Ensure condition evaluation correctly keeps the loop running until the sum condition is met.    - **Incorrect Condition Evaluation**: This tests whether the loop may prematurely terminate or continue due to incorrect condition evaluations.
+
+(assert_invalid
+  (module
+    (func $sum_loop (result i32)
+      (local $sum i32)
+      (local $i i32)
+      (i32.const 1)
+      (set_local $i)
+      (i32.const 0)
+      (set_local $sum)
+      (loop (result i32)
+        (get_local $i)
+        (i32.const 10)
+        (i32.le_s)
+        (br_if 1) 
+        (get_local $sum)
+        (get_local $i)
+        (i32.add)
+        (set_local $sum)
+        (get_local $i)
+        (i32.const 1)
+        (i32.add)
+        (set_local $i)
+        (br_if 0
+          (get_local $sum)
+          (i32.const 55)
+          (i32.gt_s)
+        )
+        (get_local $sum)
+      )
+    )
+  )
+  "type mismatch"
+)

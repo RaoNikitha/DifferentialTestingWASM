@@ -1,0 +1,3 @@
+;; 4. Construct a WebAssembly module (`Module A`) with a block containing an `unreachable` followed by an instruction. Export the function and import it into another module (`Module B`). Invoke the function from `Module B` and ensure that the call leads to a trap early within the block, validating correct control flow across the modules.
+
+(assert_invalid (module (func $nested_unreachable_followed_by_instruction (block (unreachable) (i32.const 0)))) "type mismatch")

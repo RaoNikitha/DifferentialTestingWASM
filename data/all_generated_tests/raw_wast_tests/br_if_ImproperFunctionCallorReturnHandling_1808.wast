@@ -1,0 +1,3 @@
+;; 9. **Test: Callable Function Post Conditional Branch**    - **Description:** Define a function called conditionally after a `br_if` in a loop. Ensure that the function call adjusts the operand stack appropriately and the conditional branch does not affect its execution.    - **Constraint Check:** Checks that the operand stack remains valid post-branch and proper function call execution without stack anomalies.
+
+(assert_invalid (module (func $test (block $outer (loop $inner (i32.const 1) (br_if $outer (i32.const 1)) (call $someFunction))))) "type mismatch")

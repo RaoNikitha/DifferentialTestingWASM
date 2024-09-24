@@ -1,0 +1,3 @@
+;; 9. **Test Description**:    Design a block that utilizes both local variables and stack operations, ensuring values from locals are correctly transferred to the stack and consumed by the block logic. Verify that after block completion, the stack state aligns with the expectations set by the blocktype regarding what should remain on the stack.
+
+(assert_invalid (module (func $block-local-stack-interaction (param i32) (result i32) (local i32) local.get 0 local.get 1 block (result i32) i32.add end) local.get 0)) "type mismatch")

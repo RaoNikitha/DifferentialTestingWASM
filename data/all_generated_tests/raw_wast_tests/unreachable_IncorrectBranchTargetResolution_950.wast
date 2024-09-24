@@ -1,0 +1,3 @@
+;; 1. **Nested Blocks Misresolution Test:**    - Place an `unreachable` instruction within nested blocks and follow it with a `br` instruction intended to target an outer block. Verify if the trap correctly stops execution, and if not, check if the program incorrectly jumps to an unintended block.
+
+(assert_invalid (module (func $type-nested-blocks-misresolution (block (block (block (unreachable) (br 2)))))) "type mismatch")

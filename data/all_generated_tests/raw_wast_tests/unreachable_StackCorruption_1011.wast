@@ -1,0 +1,31 @@
+;; 2. **Test: Deep Nesting with Unreachable**    - Use `block` and `loop` instructions to deeply nest an `unreachable` and then follow with more complex operations like `i32.add`.    - **Stack Corruption Check:** Test how stack states are reset and maintained after deep nesting and `unreachable` execution.
+
+(assert_invalid
+  (module
+    (func (result i32)
+      (block (result i32)
+        (block (result i32)
+          (block (result i32)
+            (block (result i32)
+              (block (result i32)
+                (loop (result i32)
+                  (loop (result i32)
+                    (unreachable)
+                  )
+                  (i32.const 1)
+                )
+                (i32.const 2)
+              )
+              (i32.const 3)
+            )
+            (i32.const 4)
+          )
+          (i32.const 5)
+        )
+        (i32.const 6)
+      )
+      (i32.add)
+    )
+  )
+  "type mismatch"
+)

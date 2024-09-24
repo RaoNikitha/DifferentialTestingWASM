@@ -1,0 +1,30 @@
+;; - **Test 5**: Create a sequence of loops, where each loop performs extensive stack manipulation. Between these loops, intersperse conditional branches. This will check if the control flow correctly handles stack states across multiple loops without causing spillage or leaks.
+
+(assert_invalid
+  (module
+    (func (result i32)
+      (loop (param i32)
+        (i32.const 1)
+        (i32.add)
+        (br_if 0)
+      )
+      (loop (param i32)
+        (i32.const 2)
+        (i32.sub)
+        (br_if 0)
+      )
+      (loop $l3 (param i32)
+        (i32.const 3)
+        (i32.mul)
+        (br_if 0)
+      )
+      (loop (param i32)
+        (i32.const 4)
+        (i32.div_s)
+        (br_if 0)
+      )
+      (i32.const 5)
+    )
+  )
+  "type mismatch"
+)

@@ -1,0 +1,3 @@
+;; 1. **Test Description: Misindexed Label Reference**    - **Reasoning**: The `br_if` instruction should validate that the label index `l` is within the bounds of the current context `C.labels`.    - **Constraint Checked**: Label index space validation (`C.labels[l]`) relative lookup.    - **Inconsistent CFG**: If the CFG incorrectly resolves label indices absolutely rather than relatively, the branching would target invalid or undefined control structures.    - **Expected Differential Behavior**: The WASM code should raise a generic invalid error, while the wizard_engine should signal an `OobLabel` error.
+
+(assert_invalid (module (func $misindexed-label-reference (block (br_if 1 (i32.const 1))))) "unknown label")

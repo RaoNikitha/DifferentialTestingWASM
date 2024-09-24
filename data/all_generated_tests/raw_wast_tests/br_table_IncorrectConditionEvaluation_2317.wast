@@ -1,0 +1,66 @@
+;; 7. Use a high operand value beyond the number of available labels in a deeply nested block to an operand-intensive `br_table`. Confirm if the default label is triggered without unexpected stack modifications.
+
+(assert_invalid
+  (module (func $deep-nested-operand-intensive
+    (block
+      (block
+        (block
+          (block
+            (block
+              (block
+                (block
+                  (block
+                    (block
+                      (block
+                        (block
+                          (block
+                            (block
+                              (block
+                                (block
+                                  (block
+                                    (block
+                                      (block
+                                        (block
+                                          (block
+                                            (block
+                                              (block
+                                                (block
+                                                  (block
+                                                    (block
+                                                      (block
+                                                        (block
+                                                          (block
+                                                            (block
+                                                              (br_table 0 0 0 0x100000 (i32.const 999999))
+                                                            )
+                                                          )
+                                                        )
+                                                      )
+                                                    )
+                                                  )
+                                                )
+                                              )
+                                            )
+                                          )
+                                        )
+                                      )
+                                    )
+                                  )
+                                )
+                              )
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  ))
+  "unknown label"
+)

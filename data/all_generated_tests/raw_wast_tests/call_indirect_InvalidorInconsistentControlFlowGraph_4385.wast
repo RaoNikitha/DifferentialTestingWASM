@@ -1,0 +1,30 @@
+;; 4. **Test 4: Nested Indirect Calls with Different Tables**:    - **Description**: Design a module where nested `call_indirect` instructions reference different tables with varying sizes and valid entries.    - **Constraint Checked**: Validates multi-level indirect function calls and proper table usage.    - **CFG Relation**: Tests CFG accuracy in reflecting nested call structures and maintaining correct control flow across different tables.
+
+(assert_invalid
+  (module
+    (type $sig1 (func (param i32) (result i32)))
+    (type $sig2 (func (param i32 i32) (result i32)))
+    (table $table1 2 funcref)
+    (table $table2 3 funcref)
+    (elem (i32.const 0) $func1 $func2)
+    (elem $table2 (i32.const 0) $func3 $func4)
+    (func $func1 (param i32) (result i32)
+      (local.get 0)
+    )
+    (func $func2 (param i32) (result i32)
+      (local.get 0)
+    )
+    (func $func3 (param i32 i32) (result i32)
+      (i32.add (local.get 0) (local.get 1))
+    )
+    (func $func4 (param i32 i32) (result i32)
+      (i32.sub (local.get 0) (local.get 1))
+    )
+    (func $nested-call (param i32) (result i32)
+      (local $x i32)
+      (local.set $x (call_indirect (type $sig1) (i32.const 0) (local.get 0)))
+      (call_indirect $table2 (type $sig2) (local.get $x) (i32.const 1) (i32.const 1))
+    )
+  )
+  "type mismatch"
+)
