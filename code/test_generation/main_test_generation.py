@@ -3,7 +3,7 @@ import sys
 import time
 import pandas as pd
 sys.path.append('../')
-from utils.data_utils import load_file, save_file
+from utils.data_utils import load_file, save_file, create_dir
 from utils.prompt_utils import generate_test_body
 import glob
 import random
@@ -41,8 +41,10 @@ def main():
     model = "gpt-4o"
     
     human_written_tests_path = '../human_written_tests/WebAssembly/processed_control_flow_validation'
-    output_path = f'./output/target_bug_guided_code_diff_{implementation1}_{implementation2}_gpt4o'
-
+    output_path = f'../../data/all_generated_tests/target_bug_guided_code_diff_{implementation1}_{implementation2}_gpt4o'
+    
+    create_dir(output_path)
+    
     print('----------------<output>-------------------')
 
     nl_desc_count = 0

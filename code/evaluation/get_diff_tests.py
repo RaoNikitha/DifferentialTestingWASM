@@ -8,6 +8,7 @@ import json
 test_implementation = 'wizard_eng'
 #test_implementation = 'v8'
 #test_implementation = 'wasmtime'
+
 tests_file_path = '../../data/all_generated_tests/raw_wast_tests'
 raw_data = load_file(f'../test_generation/output/logs_{test_implementation}__wasm_spec.out')
 
@@ -48,12 +49,12 @@ for i, sample in enumerate(samples):
         diff_tests['spec_interpreter_output'].append(spec_interpreter_output) 
         diff_tests[f'{test_implementation}_output'].append(target_interpreter_output) 
     
-    with open(f'./diff_tests__wasm_spec__{test_implementation}.json', 'w') as f:
+    with open(f'./output/diff_tests__wasm_spec__{test_implementation}.json', 'w') as f:
         json.dump(diff_tests, f) 
 
-df = pd.read_json(f'./diff_tests__wasm_spec__{test_implementation}.json')
+df = pd.read_json(f'./output/diff_tests__wasm_spec__{test_implementation}.json')
 print(df)
-df.to_json(f'./diff_tests__wasm_spec__{test_implementation}_rowwise.json', orient='records')
+df.to_json(f'./output/diff_tests__wasm_spec__{test_implementation}.json', orient='records')
 
 
 # to run file

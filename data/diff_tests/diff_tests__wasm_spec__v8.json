@@ -1,0 +1,138 @@
+[
+    {
+        "instruction": "br",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/br_table_StackCorruption_2089.wast.bin.wast",
+        "filename": "br_table_StackCorruption_2089",
+        "test_content": ";; 9. **Test9: Incorrect Immediate Parameter Encoding**    - **Description:** Purposely misencode the immediate for `br_table`, either the label vector or the default label index, testing the system's reaction.    - **Stack Corruption Check:** Check if wrong encoding leads to stack corruptions or unintended operand behaviors.\n\n(assert_malformed\n  (module (func\n    (block (br_table 0x10000001 0 (i32.const 1)))\n  ))\n  \"unexpected token\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "br",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/br_table_UnreachableCodeExecution_2134.wast.bin.wast",
+        "filename": "br_table_UnreachableCodeExecution_2134",
+        "test_content": ";; 4. **Test with Misencoded Immediate Parameters:**    - Description: Create a `br_table` instruction with a vector of label indices and a default label, but deliberate misencoding of one of the parameters.    - Constraint Checked: Correct encoding of label index vectors and default label.    - Relates to Unreachable Code Execution: Misencoding could cause the branch to go to an unintended place and hit the `unreachable` instruction.\n\n(assert_malformed\n  (module\n    (func\n      (br_table 0x20 0x03 (i32.const 1)) ;; malformed immediate parameter\n    )\n  )\n  \"unexpected end of section or function\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "br",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/br_table_UnreachableCodeExecution_2147.wast.bin.wast",
+        "filename": "br_table_UnreachableCodeExecution_2147",
+        "test_content": ";; Define a `br_table` without encoding length properly for the label vector, causing it to default to a block containing an `unreachable` instruction. This test assesses the error-checking capability during the immediate parameter encoding process.\n\n(assert_malformed\n  (module (func $test-br_table-immediate-encoding (result i32)\n    (block (br_table 0 1 (i32.const 2))) (i32.const 1))\n  )\n  \"unexpected end\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "if",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/if_EdgeCaseFailuresinbr_table_2015.wast.bin.wast",
+        "filename": "if_EdgeCaseFailuresinbr_table_2015",
+        "test_content": ";; 6. **Test 6**: A `br_table` instruction inside a `then` branch with an index at the maximum `i32` value, triggered by a true `if` condition.\n\n(assert_malformed\n  (module\n    (func $br_table_max_index_true\n      (if (i32.const 1)\n        (then\n          (br_table 0xffffffff)\n        )\n      )\n    )\n  )\n  \"unknown label\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "if",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/if_InvalidorInconsistentControlFlowGraph_1779.wast.bin.wast",
+        "filename": "if_InvalidorInconsistentControlFlowGraph_1779",
+        "test_content": ";; 10. Create an `if` block where the `else` segment contains another `if` without an `end` keyword, testing the CFG's ability to detect and report incomplete nested structures.\n\n(assert_malformed\n  (module\n    (func $incomplete-nested-if\n      (i32.const 1)\n      (if (result i32)\n        (then (i32.const 0))\n        (else \n          (if (result i32) (then (i32.const 1)))\n      ))\n    )\n  )\n  \"unexpected end of section or function\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_EdgeCaseFailuresinbr_table_732.wast.bin.wast",
+        "filename": "nop_EdgeCaseFailuresinbr_table_732",
+        "test_content": ";; 3. Create a `br_table` instruction with three label targets, an index of four which is out of bounds, and place `nop` instructions interleaved between these operations. This will assess if `nop` disrupts the handling of indices in multi-target `br_table`.\n\n(assert_malformed\n  (module\n    (func $br_table-test\n      block $label0\n        block $label1\n          block $label2\n            nop\n            br_table $label0 $label1 $label2 4\n            nop\n          end\n          nop\n        end\n        nop\n      end\n    )\n  )\n  \"unknown label\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_EdgeCaseFailuresinbr_table_749.wast.bin.wast",
+        "filename": "nop_EdgeCaseFailuresinbr_table_749",
+        "test_content": ";; 10. **Test Description**: Place `nop` directly after the function entry and immediately before `br_table` having several indices, some exceeding the count of valid label branches.    - **Constraint**: Ensuring that `nop`\u2019s proximity to function start does not affect `br_table` index handling.    - **Edge Case**: Guarantees `br_table`\u2019s correct behavior with out-of-bounds targets.\n\n(assert_malformed\n  (module\n    (func $test\n      (nop)\n      (block\n        (br_table 0 1)\n      )\n    )\n  )\n  \"br_table index out of bounds\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_EdgeCaseFailuresinbr_table_767.wast.bin.wast",
+        "filename": "nop_EdgeCaseFailuresinbr_table_767",
+        "test_content": ";; 8. **Test Description**:    Include a `nop` immediately before a `br_table` with a zero index to confirm that no unexpected behavior occurs when `nop` prefaces the simplest valid index scenario.      **Specific Constraint**: Verifies `nop` does not alter zero index handling.      **Edge Case**: Zero index.\n\n(assert_malformed\n  (module\n    (func (block (nop) (br_table 0 (nop)))))\n  \"zero index handling\")",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_EdgeCaseFailuresinbr_table_786.wast.bin.wast",
+        "filename": "nop_EdgeCaseFailuresinbr_table_786",
+        "test_content": ";; 7. **Test Description**: Use a `br_table` instruction, where the index equals the number of valid targets plus one. Insert `nop` immediately before the `br_table`.     - **Constraint Checked**: Ensure that a single `nop` preceding the `br_table` does not affect the handling of an index beyond targets.     - **Edge Case Relation**: The handling of the index should trigger appropriate behavior with the exact placement of `nop`.\n\n(assert_malformed\n  (module\n    (func\n      (block $label0\n        (nop)\n        (br_table $label0 $label0 2)\n      )\n    )\n  )\n  \"unexpected index in br_table\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_EdgeCaseFailuresinbr_table_790.wast.bin.wast",
+        "filename": "nop_EdgeCaseFailuresinbr_table_790",
+        "test_content": ";; 1. Create a test where a `br_table` instruction is preceded by multiple `nop` instructions and the index provided to `br_table` is equal to the number of targets. This tests if the `nop` instructions are correctly ignored before reaching the `br_table` and properly handling an index equal to the number of available targets.\n\n(assert_malformed\n  (module \n    (func \n      (block \n        (br_table 0 1 2 3)\n        nop \n        nop \n        nop \n        nop \n        nop \n        nop \n        nop \n        nop \n        nop \n        nop \n        br_table 0 1 2\n      )\n    )\n  )\n  \"br_table index out of range\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_ImproperFunctionCallorReturnHandling_592.wast.bin.wast",
+        "filename": "nop_ImproperFunctionCallorReturnHandling_592",
+        "test_content": ";; 3. **Test Name: No-Operation Preceding Indirect Function Call**    - **Description**: Place a `nop` instruction immediately before a `call_indirect` instruction.    - **Constraint**: Verify correct function lookup and execution for `call_indirect`.    - **Improper Handling Check**: Tests if `nop` interferes with the table lookup or type checking for indirect calls.    - **Expected Behavior**: Consistent behavior in function resolution and execution between the two implementations.\n\n(assert_malformed\n  (module\n    (table $t 1 funcref)\n    (elem (i32.const 0) $f)\n    (func $f)\n    (func (result i32)\n      nop\n      (call_indirect (type 0) (i32.const 0))\n    )\n  )\n  \"type mismatch\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_IncorrectBranchTargetResolution_12.wast.bin.wast",
+        "filename": "nop_IncorrectBranchTargetResolution_12",
+        "test_content": ";; 3. **Multiple Consecutive `nop` with Conditional Branching**: Design a sequence involving multiple consecutive `nop` instructions interspersed with conditional branching (`br_if`). Ensure that `br_if` targets the accurate block and test if the no-operations (NOPs) introduce incorrect branch resolution.\n\n(assert_malformed\n  (module\n    (func $multiple-nop (param i32) (result i32)\n      (block $label\n        (nop)\n        (nop)\n        (br_if 0 (local.get 0))\n        (nop)\n        (nop)\n        (nop)\n        (i32.const 1)\n      )\n      (i32.const 0)\n    )\n  )\n  \"br_if target invalid block\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_IncorrectHandlingofControlFlowAcrossModuleBoundaries_829.wast.bin.wast",
+        "filename": "nop_IncorrectHandlingofControlFlowAcrossModuleBoundaries_829",
+        "test_content": ";; 10. **Test 10: `nop` in Indirect Call Setup through Exported Function**    - Place a `nop` before setting up an indirect call via an exported function.    - Validate that the setup, indirect call execution, and return path remain consistent, with `nop` having no effect on the operations.\n\n(assert_malformed\n  (module\n    (type $t0 (func))\n    (table $T0 1 funcref)\n    (elem (i32.const 0) func $f1)\n    (func $f1 (result i32)\n      (i32.const 42))\n    (func $f2 (result i32)\n      (nop)\n      (call_indirect (type $t0) (i32.const 0)))\n    (export \"test\" (func $f2))\n  )\n  \"type mismatch\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_InfiniteLoops_282.wast.bin.wast",
+        "filename": "nop_InfiniteLoops_282",
+        "test_content": ";; 3. **Test with `loop` containing multiple `nop` instructions and a `br_table`**:    - **Constraint**: Verifies if `nop` interspersed with `br_table` in a loop control structure is properly handled.    - **Relation to Infinite Loops**: If `nop` alters the jump table or the control flow, the loop may not exit as intended, leading to an infinite loop.\n\n(assert_malformed\n  (module\n    (func (loop\n      nop\n      (br_table 0 0 (nop))\n      nop\n    ))\n  )\n  \"invalid br_table targets\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_UnreachableCodeExecution_192.wast.bin.wast",
+        "filename": "nop_UnreachableCodeExecution_192",
+        "test_content": ";; Test 3: Embed `nop` within nested `if` and `else` blocks where the `else` block contains an `unreachable`. Validate that none of the `nop` instructions prevent reaching the `unreachable` when the `else` block is executed.\n\n(assert_malformed\n  (module\n    (func (result i32)\n      (if (i32.const 0)\n        (then\n          (nop)\n        )\n        (else\n          (nop)\n          (unreachable)\n        )\n      )\n    )\n  )\n  \"unreachable\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_UnreachableCodeExecution_207.wast.bin.wast",
+        "filename": "nop_UnreachableCodeExecution_207",
+        "test_content": ";; 8. Verify behavior of `nop` in `loop` and use `br_if` to skip by `unreachable`:    - `i32.const 5`    - `loop`    - `nop`    - `br_if 0`    - `unreachable`    - `end`\n\n(assert_malformed\n  (module\n    (func (result i32)\n      (i32.const 5)\n      (loop (result i32)\n        nop\n        (br_if 0 (i32.const 1))\n        unreachable\n      )\n    )\n  )\n  \"unexpected end of loop\")",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    },
+    {
+        "instruction": "nop",
+        "filepath": "\/Users\/evgilber\/tmp\/JS_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/nop_UnreachableCodeExecution_209.wast.bin.wast",
+        "filename": "nop_UnreachableCodeExecution_209",
+        "test_content": ";; 10. Test `nop` within a `return` block, checking execution ends at `unreachable`:    - `block`    - `i32.const 1`    - `return`    - `nop`    - `unreachable`    - `end`    - `i32.const 45`\n\n(assert_malformed\n  (module\n    (func\n      (block\n        (i32.const 1)\n        (return)\n        nop\n        unreachable\n      )\n      (i32.const 45)\n    )\n  )\n  \"module parsing failed\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "v8_output": "PASS"
+    }
+]

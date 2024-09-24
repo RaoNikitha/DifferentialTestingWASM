@@ -3,12 +3,12 @@
 ## Setting up your environment
 
 Run the following command to setup the environment and install all the dependencies listed in `/code/requirements.txt`.
-```
+```bash
 ./code/setup_env.sh
 ```
 
 Set the environment variable with the OpenAI API key. 
-```
+```bash
 export OPENAI_API_KEY="<ENTER OPENAI API KEY>"
 ```
 
@@ -18,26 +18,26 @@ All the scripts to extract relevant context can be found under `/code/extract_co
 ### 1.1. Extract list of instructions and map instructions to relevant human written tests. 
 
 Extract the list of instructions from the specifications document and generate a mapping between instructions and human written test files from the [wasm spec repo](https://github.com/WebAssembly/spec/tree/main/test/core).
-```
+```bash
 python3 main_extract_instruction_test_map.py
 ```
 
 ### 1.2. Extract constraints
 Extract all the relevant constraints for each instruction from the [WASM specifications document](https://webassembly.github.io/spec/core/).
-```
+```bash
 python3 main_extract_constraints.py
 ```
 
 ### 1.3. Extract relevant context from code
 For a given implementation, extract the relevant code snippet from the source code files for each instruction. Then generate a list of differences (described in natural language) between the extracted code snippets.
-```
+```bash
 python3 main_extract_code_diffs.py
 ```
 
 ### 1.4. Preprocess human written tests
 
 The human written test files have several test cases in each file for a given instruction. We preprocess these files to only keep the test cases relevant to validation and separate them by creating a new file for each test case.
-```
+```bash
 python3 main_separate_human_tests.py
 ```
 
@@ -46,13 +46,13 @@ The test generation framework includes two main steps. The scripts can be found 
 
 ### 2.1 Generate test descriptions
 First, we use all the extracted information as context to prompt the LLM to generate descriptions of what each test should do.
-```
+```bash
 python3 main_test_decription_generation.py
 ```
 
 ### 2.2 Generate tests from descriptions
 We then use the test descriptions along with few randomly sampled human written tests, as few shot examples, and a list of human written guidelines to generate the tests themselves.
-```
+```bash
 python3 main_test_generation.py
 ```
 
@@ -170,7 +170,7 @@ You'll need to pick up from section 4.3 and 4.4 to run the tests. Remember to ch
 
 * `/code/context/` has all the relevant context including the source code files, extracted constraints, bug classes and their descriptions, extracted code context (includes relevant code snippets for instruction, and list of differences between the implementations), and the generated test descriptions.  
 
-* `/code/human_written_tests/WebAssembly/processed_control_flow_validation/` has both the relevant human written test files as well as the processed tests files (See [section 1.4](#14-preprocess-human-written-tests)).
+* `/code/human_written_tests/WebAssembly/processed_control_flow_validation/` has both the relevant human written test files as well as the processed tests files (See [Section 1.4](#14-preprocess-human-written-tests)).
 
 
 ## References
@@ -179,3 +179,4 @@ You'll need to pick up from section 4.3 and 4.4 to run the tests. Remember to ch
 - [Wizard Engine](https://github.com/titzer/wizard-engine)
 - [wasmtime](https://github.com/bytecodealliance/wasmtime)
 - [v8](https://chromium.googlesource.com/v8/v8.git)
+- [GPT-4o](https://openai.com/index/hello-gpt-4o/)

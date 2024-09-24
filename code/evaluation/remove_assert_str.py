@@ -1,10 +1,12 @@
 import os
 import sys
 sys.path.append('../')
-from utils.data_utils import load_file, save_file
+from utils.data_utils import load_file, save_file, create_dir
 
 input_path = '../../data/raw_wast_tests/'
 output_path = '../../data/no_assert_str_wast_tests/'
+
+create_dir(output_path)
 
 file_names = sorted([file for file in os.listdir(input_path) if file.endswith('.wast')])
 print(len(file_names))

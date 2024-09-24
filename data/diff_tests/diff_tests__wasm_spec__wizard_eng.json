@@ -1,0 +1,58 @@
+[
+    {
+        "instruction": "call",
+        "filepath": ".\/BIN_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/call_indirect_ImproperFunctionCallorReturnHandling_4487.wast.bin.wast",
+        "filename": "call_indirect_ImproperFunctionCallorReturnHandling_4487",
+        "test_content": ";; 6. **Test Description**: Perform a `call_indirect` with an index referring to a function requiring a `funcref` table but passing a table of objects, forcing a type mismatch trap.    - **Constraint Checked**: Table type and reference type conformity.    - **Relation to Improper Handling**: Ensures only tables with correct reference types (`funcref`) are accessed.\n\n(assert_invalid\n  (module\n    (type (func))\n    (table 10 externref)\n    (func $call-indirect (call_indirect (type 0) (i32.const 0)))\n  )\n  \"type mismatch\"\n)\n",
+        "spec_interpreter_output": "PASS",
+        "wizard_eng_output": "FAIL"
+    },
+    {
+        "instruction": "call",
+        "filepath": ".\/BIN_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/call_indirect_IncorrectConditionEvaluation_4298.wast.bin.wast",
+        "filename": "call_indirect_IncorrectConditionEvaluation_4298",
+        "test_content": ";; 7. Assess the handling of `call_indirect` when the provided table index points to non-`funcref` type entries, ensuring that the implementations accurately enforce table type constraints.\n\n(assert_invalid\n  (module\n    (type (func (param i32)))\n    (table 1 externref)\n    (func $type-table-non-funcref (call_indirect (type 0) (i32.const 0) (i32.const 0)))\n  )\n  \"type mismatch\"\n)",
+        "spec_interpreter_output": "PASS",
+        "wizard_eng_output": "FAIL"
+    },
+    {
+        "instruction": "call",
+        "filepath": ".\/BIN_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/call_indirect_IncorrectConditionEvaluation_4321.wast.bin.wast",
+        "filename": "call_indirect_IncorrectConditionEvaluation_4321",
+        "test_content": ";; 10. **Dangling Type Index in Conditional Branch**:    - Use a `br_if` to conditionally call `call_indirect` with an invalid `typeidx`.    - Ensure the test evaluates whether the condition leads to a failed execution in OCaml and potentially improper checks in Java.\n\n(assert_invalid\n  (module\n    (type (func (param i32)))\n    (table 1 funcref)\n    (func $conditional-dangling-type\n      (if (i32.const 1)\n        (then (call_indirect (type 0xffffffff) (i32.const 0)))\n      )\n    )\n  )\n  \"type index out of bounds\"\n)",
+        "spec_interpreter_output": "PASS",
+        "wizard_eng_output": "FAIL"
+    },
+    {
+        "instruction": "call",
+        "filepath": ".\/BIN_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/call_indirect_IncorrectHandlingofControlFlowAcrossModuleBoundaries_4719.wast.bin.wast",
+        "filename": "call_indirect_IncorrectHandlingofControlFlowAcrossModuleBoundaries_4719",
+        "test_content": ";; Create cyclic imports where module A imports a function from module B, and module B imports a function from module A. Perform indirect calls in both directions, ensuring that stack state and control flow are preserved correctly.\n\n(assert_invalid\n  (module\n    (import \"B\" \"func_b\" (func $func_b (param i32) (result i32)))\n    (func (export \"func_a\") (param i32) (result i32)\n      (call_indirect (type 0) (local.get 0))\n    )\n    (table 1 funcref)\n    (elem (i32.const 0) $func_b)\n    (type (func (param i32) (result i32)))\n  )\n  \"invalid import\"\n)\n(assert_invalid\n  (module\n    (import \"A\" \"func_a\" (func $func_a (param i32) (result i32)))\n    (func (export \"func_b\") (param i32) (result i32)\n      (call_indirect (type 0) (local.get 0))\n    )\n    (table 1 funcref)\n    (elem (i32.const 0) $func_a)\n    (type (func (param i32) (result i32)))\n  )\n  \"invalid import\"\n)",
+        "spec_interpreter_output": "FAIL",
+        "wizard_eng_output": "PASS"
+    },
+    {
+        "instruction": "call",
+        "filepath": ".\/BIN_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/call_indirect_StackCorruption_3996.wast.bin.wast",
+        "filename": "call_indirect_StackCorruption_3996",
+        "test_content": ";; 5. **Table Type Mismatch**:    - Design a test where the table contains elements that are not of `funcref` type but attempt a `call_indirect`. The improper table type might not be checked correctly by one implementation, leading to stack misbehaviour.\n\n(assert_invalid\n  (module\n    (type (func (param i32)))\n    (table 0 externref)\n    (func $invalid-table-type\n      (call_indirect (type 0) (i32.const 0) (i32.const 1))\n    )\n  )\n  \"type mismatch\"\n)",
+        "spec_interpreter_output": "PASS",
+        "wizard_eng_output": "FAIL"
+    },
+    {
+        "instruction": "call",
+        "filepath": ".\/BIN_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/call_indirect_TypeMismatchinControlFlowInstructions_4562.wast.bin.wast",
+        "filename": "call_indirect_TypeMismatchinControlFlowInstructions_4562",
+        "test_content": ";; 1. **Test for Invalid Table Type as Immediate:**    - Verify behavior when `call_indirect` references a table that does not have type `funcref`. Ensure that the OCaml implementation correctly traps due to type mismatch, while the Java implementation throws an error using the type-checking helper method.\n\n(assert_invalid\n  (module\n    (type (func (param i32) (result i32)))\n    (table 0 externref)\n    (func (result i32)\n      (call_indirect (type 0) (i32.const 0) (i32.const 0))\n    )\n  )\n  \"type mismatch\"\n)",
+        "spec_interpreter_output": "PASS",
+        "wizard_eng_output": "FAIL"
+    },
+    {
+        "instruction": "call",
+        "filepath": ".\/BIN_NO-STR-ASRTS_target_bug_guided_code_diff_WebAssembly_wizard_engine_gpt4o\/call_indirect_UnreachableCodeExecution_4100.wast.bin.wast",
+        "filename": "call_indirect_UnreachableCodeExecution_4100",
+        "test_content": ";; 9. **Test: Invalid Table Type Reference Check**    - Description: Create a table with non-`funcref` type references and invoke its function indirectly. The mismatch should cause a `trap` resulting in execution reaching `unreachable`.    - Constraint: Table element must be of type `funcref`.    - Unreachable Execution: Type inconsistencies direct flow to `unreachable`.\n\n(assert_invalid\n  (module\n    (type (func))\n    (table 1 externref)\n    (func $invalid-table-type\n      (call_indirect (type 0) (i32.const 0))\n    )\n  )\n  \"table element type mismatch\"\n)",
+        "spec_interpreter_output": "PASS",
+        "wizard_eng_output": "FAIL"
+    }
+]

@@ -1,7 +1,7 @@
 from langchain_community.document_loaders import PyMuPDFLoader
 import pandas as pd
 import json
-
+from pathlib import Path
 
 # load file given path
 def load_file(file_path):
@@ -28,3 +28,7 @@ def load_json(file_path):
 def save_file(content, path):
     with open(path, 'w') as output:
         output.write(content)
+
+
+def create_dir(path):
+    Path(path).mkdir(parents=True, exist_ok=True)
